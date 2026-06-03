@@ -91,6 +91,8 @@ PROJECT_START_FILE = os.path.join(
     SCRIPT_DIR, 'templates', 'КАК НАЧАТЬ РАБОТУ НАД ПРОЕКТОМ В БАШНЕ.docx'
 )
 
+OTHER_QUESTION_BUTTON = '❓ Иной вопрос'
+
 # Маппинг типов служебок на ID в БД
 service_type_ids = {
     'аудитория': 1,
@@ -176,6 +178,8 @@ def get_main_keyboard():
     keyboard.add_button('🎮 Плейстейшен', VkKeyboardColor.PRIMARY)
     keyboard.add_line()
     keyboard.add_button(PROJECT_START_BUTTON, VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button(OTHER_QUESTION_BUTTON, VkKeyboardColor.SECONDARY)
     # keyboard.add_line()
     # keyboard.add_button('🎬 Медиапроект', VkKeyboardColor.PRIMARY)
     return keyboard.get_keyboard()
@@ -853,6 +857,17 @@ def main():
                 print(f"⚠️ Ошибка логирования входящего сообщения: {e}")
 
             state = user_states[user_id]
+
+            # Режим «иной вопрос»: бот не отвечает, пока пользователь не напишет «начать»
+            if state['step'] == 'other_question_silent':
+                if text_lower == 'начать' or '🚀 начать' in text_lower:
+                    reset_state(user_id)
+                    send_message(
+                        user_id,
+                        '👋 Добро пожаловать! Выберите нужную услугу:',
+                        keyboard=get_main_keyboard()
+                    )
+                continue
             
             # Универсальная обработка кнопки "Главное меню" для всех состояний
             if ('🏠' in text or 'главное меню' in text_lower) and state['step'] != 'start':
@@ -926,7 +941,7 @@ def main():
                 continue
 
             # НАЧАЛЬНОЕ СОСТОЯНИЕ - показываем стартовую клавиатуру при первом входе
-            if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен', 'проект', 'башн']):
+            if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен', 'проект', 'башн', 'иной', 'вопрос']):
                 send_message(
                     user_id,
                     '👋 Добро пожаловать в бот Башни Политеха!\n\nНажмите "Начать" для работы с ботом:',
@@ -1006,6 +1021,14 @@ def main():
                             '❌ Файл инструкции не найден. Обратитесь к администратору.',
                             keyboard=get_main_keyboard()
                         )
+                    continue
+                elif text == OTHER_QUESTION_BUTTON or 'иной вопрос' in text_lower:
+                    send_message(
+                        user_id,
+                        '✍️ Напишите интересующий вас вопрос — администратор Башни увидит его в этом чате и ответит.\n\n'
+                        'Чтобы снова пользоваться меню бота, напишите «начать».'
+                    )
+                    state['step'] = 'other_question_silent'
                     continue
                 # elif '🎬' in text or 'медиа' in text_lower:
                 #     send_message(
