@@ -82,11 +82,12 @@ templates = {
     'письмо поддержки': os.path.join(SCRIPT_DIR, 'templates', 'Шаблон_письма_поддержки (2).docx')
 }
 
-PROJECT_START_BUTTON = 'КАК НАЧАТЬ РАБОТУ НАД ПРОЕКТОМ В БАШНЕ'
-PROJECT_START_GREETING = (
-    'Проектная среда - регулярное мероприятие, где команда Башни, а также приглашенные гости, '
-    'могут посмотреть на Ваш проект и подсказать пути его развития.'
-)
+PROJECT_START_BUTTON = '📋 Проектная среда'
+PROJECT_START_INTRO = '''📋 Проектная среда
+
+Регулярные встречи, где команда Башни и приглашённые гости смотрят на ваш проект и подсказывают, как его развивать.
+
+Нажмите «Да», чтобы получить инструкцию по участию.'''
 PROJECT_START_FILE = os.path.join(
     SCRIPT_DIR, 'templates', 'КАК НАЧАТЬ РАБОТУ НАД ПРОЕКТОМ В БАШНЕ.docx'
 )
@@ -604,16 +605,13 @@ def _attachment_from_docs_save(saved):
         return f"doc{item['owner_id']}_{item['id']}"
     raise ValueError(f'Не удалось извлечь doc из ответа: {item!r}')
 
-def send_document(user_id, file_path):
-    """Отправка документа пользователю"""
+def send_document(user_id, file_path, message='', keyboard=None):
+    """Отправка документа пользователю (опционально с текстом и клавиатурой в одном сообщении)."""
     try:
-        print(f"Попытка отправить файл: {file_path}")
-        print(f"Файл существует: {os.path.exists(file_path)}")
-        
         if not os.path.exists(file_path):
             print(f"Файл не найден по пути: {file_path}")
             return False
-        
+
         file_name = os.path.basename(file_path)
         upload = vk_api.VkUpload(vk_session)
         saved = None
@@ -641,9 +639,12 @@ def send_document(user_id, file_path):
             raise last_err
 
         attachment = _attachment_from_docs_save(saved)
+        text = message.strip() if message else None
         vk.messages.send(
             user_id=user_id,
+            message=text,
             attachment=attachment,
+            keyboard=keyboard,
             random_id=random.randint(0, 2**31)
         )
         print(f"✅ Файл успешно отправлен: {file_path}")
@@ -815,6 +816,7 @@ def get_navigation_state(current_step, dialog_history=None):
         'service_date': 'service_confirm',
         'support_letter_confirm': 'choose_service_type',
         'trip_questions': 'choose_service_type',
+        'project_start_confirm': 'start',
         'ps_menu': 'start',
         'ps_date': 'ps_menu',
         'ps_time': 'ps_date',
@@ -994,7 +996,7 @@ def main():
                 continue
 
             # НАЧАЛЬНОЕ СОСТОЯНИЕ - показываем стартовую клавиатуру при первом входе
-            if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен', 'проект', 'башн', 'иной', 'вопрос']):
+            if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен', 'проект', 'башн', 'иной', 'вопрос', 'проектная']):
                 send_message(
                     user_id,
                     '👋 Добро пожаловать в бот Башни Политеха!\n\nНажмите "Начать" для работы с ботом:',
@@ -1051,29 +1053,13 @@ def main():
                     state['step'] = 'ps_menu'
                     state['ps'] = {}
                     continue
-                elif text == PROJECT_START_BUTTON or (
-                    'как начать' in text_lower and 'проект' in text_lower and 'башн' in text_lower
-                ):
-                    send_message(user_id, PROJECT_START_GREETING)
-                    if os.path.exists(PROJECT_START_FILE):
-                        if send_document(user_id, PROJECT_START_FILE):
-                            send_message(
-                                user_id,
-                                '📎 Инструкция отправлена.',
-                                keyboard=get_main_keyboard()
-                            )
-                        else:
-                            send_message(
-                                user_id,
-                                '❌ Не удалось отправить файл инструкции. Попробуйте позже.',
-                                keyboard=get_main_keyboard()
-                            )
-                    else:
-                        send_message(
-                            user_id,
-                            '❌ Файл инструкции не найден. Обратитесь к администратору.',
-                            keyboard=get_main_keyboard()
-                        )
+                elif text == PROJECT_START_BUTTON or 'проектная среда' in text_lower:
+                    send_message(
+                        user_id,
+                        PROJECT_START_INTRO,
+                        keyboard=get_yes_no_keyboard()
+                    )
+                    state['step'] = 'project_start_confirm'
                     continue
                 elif text == OTHER_QUESTION_BUTTON or 'иной вопрос' in text_lower:
                     send_message(
@@ -1218,6 +1204,42 @@ def main():
                         user_id,
                         '❌ Ответьте "Да" или "Нет":',
                         keyboard=get_yes_no_keyboard()
+                    )
+
+            elif state['step'] == 'project_start_confirm':
+                if text_lower == 'да':
+                    if os.path.exists(PROJECT_START_FILE):
+                        if send_document(
+                            user_id,
+                            PROJECT_START_FILE,
+                            message='📎 Инструкция по участию в проектной среде.',
+                            keyboard=get_main_keyboard(),
+                        ):
+                            reset_state(user_id)
+                        else:
+                            send_message(
+                                user_id,
+                                '❌ Не удалось отправить файл. Попробуйте нажать «Да» ещё раз.',
+                                keyboard=get_yes_no_keyboard(),
+                            )
+                    else:
+                        send_message(
+                            user_id,
+                            '❌ Файл инструкции не найден. Обратитесь к администратору.',
+                            keyboard=get_main_keyboard(),
+                        )
+                        reset_state(user_id)
+                elif text_lower == 'нет':
+                    send_message(
+                        user_id,
+                        PROJECT_START_INTRO,
+                        keyboard=get_yes_no_keyboard(),
+                    )
+                else:
+                    send_message(
+                        user_id,
+                        '❌ Ответьте «Да», чтобы получить инструкцию, или «Нет»:',
+                        keyboard=get_yes_no_keyboard(),
                     )
 
             # Обработка поездки
