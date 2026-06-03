@@ -82,6 +82,15 @@ templates = {
     'письмо поддержки': os.path.join(SCRIPT_DIR, 'templates', 'Шаблон_письма_поддержки (2).docx')
 }
 
+PROJECT_START_BUTTON = 'КАК НАЧАТЬ РАБОТУ НАД ПРОЕКТОМ В БАШНЕ'
+PROJECT_START_GREETING = (
+    'Проектная среда - регулярное мероприятие, где команда Башни, а также приглашенные гости, '
+    'могут посмотреть на Ваш проект и подсказать пути его развития.'
+)
+PROJECT_START_FILE = os.path.join(
+    SCRIPT_DIR, 'templates', 'КАК НАЧАТЬ РАБОТУ НАД ПРОЕКТОМ В БАШНЕ.docx'
+)
+
 # Маппинг типов служебок на ID в БД
 service_type_ids = {
     'аудитория': 1,
@@ -165,6 +174,8 @@ def get_main_keyboard():
     keyboard.add_button('🏢 Бронь переговорки', VkKeyboardColor.PRIMARY)
     keyboard.add_line()
     keyboard.add_button('🎮 Плейстейшен', VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button(PROJECT_START_BUTTON, VkKeyboardColor.PRIMARY)
     # keyboard.add_line()
     # keyboard.add_button('🎬 Медиапроект', VkKeyboardColor.PRIMARY)
     return keyboard.get_keyboard()
@@ -915,7 +926,7 @@ def main():
                 continue
 
             # НАЧАЛЬНОЕ СОСТОЯНИЕ - показываем стартовую клавиатуру при первом входе
-            if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен']):
+            if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен', 'проект', 'башн']):
                 send_message(
                     user_id,
                     '👋 Добро пожаловать в бот Башни Политеха!\n\nНажмите "Начать" для работы с ботом:',
@@ -971,6 +982,30 @@ def main():
                     )
                     state['step'] = 'ps_menu'
                     state['ps'] = {}
+                    continue
+                elif text == PROJECT_START_BUTTON or (
+                    'как начать' in text_lower and 'проект' in text_lower and 'башн' in text_lower
+                ):
+                    send_message(user_id, PROJECT_START_GREETING)
+                    if os.path.exists(PROJECT_START_FILE):
+                        if send_document(user_id, PROJECT_START_FILE):
+                            send_message(
+                                user_id,
+                                '📎 Инструкция отправлена.',
+                                keyboard=get_main_keyboard()
+                            )
+                        else:
+                            send_message(
+                                user_id,
+                                '❌ Не удалось отправить файл инструкции. Попробуйте позже.',
+                                keyboard=get_main_keyboard()
+                            )
+                    else:
+                        send_message(
+                            user_id,
+                            '❌ Файл инструкции не найден. Обратитесь к администратору.',
+                            keyboard=get_main_keyboard()
+                        )
                     continue
                 # elif '🎬' in text or 'медиа' in text_lower:
                 #     send_message(
