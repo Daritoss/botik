@@ -385,6 +385,59 @@ def parse_participants_count(text: str) -> int:
     return int(m.group(0))
 
 
+def parse_booking_datetime_range(text: str) -> tuple:
+    """Диапазон брони переговорки: ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ"""
+    s = str(text or '').strip().replace('\u00a0', ' ')
+    m = re.match(
+        r'(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})',
+        s
+    )
+    if not m:
+        raise ValueError('format')
+    date_str, start_t, end_t = m.group(1), m.group(2), m.group(3)
+    start_dt = datetime.datetime.strptime(f'{date_str} {start_t}', '%d.%m.%Y %H:%M')
+    end_dt = datetime.datetime.strptime(f'{date_str} {end_t}', '%d.%m.%Y %H:%M')
+    if end_dt <= start_dt:
+        raise ValueError('end before start')
+    return start_dt, end_dt
+
+
+def format_booking_equipment(equipment) -> str:
+    if isinstance(equipment, list):
+        equipment = ', '.join(equipment) if equipment else ''
+    equipment = str(equipment or '').strip()
+    return equipment if equipment else 'не требуется'
+
+
+def format_booking_time_range(start: datetime.datetime, end: datetime.datetime) -> str:
+    return f"{start.strftime('%d.%m.%Y %H:%M')}-{end.strftime('%H:%M')}"
+
+
+def build_room_booking_summary(booking: dict) -> str:
+    time_range = format_booking_time_range(booking['datetime_start'], booking['datetime_end'])
+    equipment = format_booking_equipment(booking.get('equipment'))
+    return f'''Заявка на бронь переговорки принята!
+
+Детали брони:
+• Мероприятие: {booking['name']}
+• Формат: {booking['format']}
+• Участников: {booking['people']}
+• Дата и время: {time_range}
+• Оборудование: {equipment}
+• Переговорка: {booking['room']}
+
+Спасибо за обращение!
+
+Просьба зарегистрировать мероприятия в системе Leader-ID не позднее чем за 24 часа до мероприятия, иначе бронь будет аннулирована.
+При создании убедитесь в правильности выбранного места проведения, даты и времени.
+https://vk.com/@prostranstvo_vozmozhnostey-kak-provesti-meropriyatie-v-bashne
+После того, как заведёте мероприятие, вернитесь в сообщения и напишите, что событие было создано.
+
+Каждый участник должен быть зарегистрирован в системе Leader-ID, а также зарегистрироваться на само мероприятие. У стойки администрации необходимо отсканировать персональный QR-код.
+
+Ждём в Башне!'''
+
+
 # Тексты и файлы превью залов — ключи должны совпадать с элементами `rooms` (один источник для фильтра и картинок)
 ROOM_DESCRIPTIONS = {
     '«Код» – до 7 чел.': '1️⃣ «Код» — до 7 человек включительно\nКомпактная переговорка для небольших встреч',
@@ -1425,7 +1478,8 @@ def main():
                         
                         send_message(
                             user_id,
-                            '🕒 Введите дату и время мероприятия в формате ДД.ММ.ГГГГ ЧЧ:ММ (например, 20.12.2025 14:30).\n'
+                            '🕒 Введите дату и время начала и окончания мероприятия в формате '
+                            'ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30).\n'
                             f'Дата не может быть позже чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с текущего момента.'
                         )
                         state['step'] = 'booking_datetime'
@@ -1440,29 +1494,42 @@ def main():
 
             elif state['step'] == 'booking_datetime':
                 try:
-                    booking_datetime = datetime.datetime.strptime(text, '%d.%m.%Y %H:%M')
+                    booking_start, booking_end = parse_booking_datetime_range(text)
                     today = datetime.datetime.now()
                     max_date = today + datetime.timedelta(days=BOOKING_ROOM_MAX_AHEAD_DAYS)
-                    
-                    if booking_datetime < today:
-                        send_message(user_id, '❌ Дата не может быть в прошлом. Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ:')
-                    elif booking_datetime > max_date:
+
+                    if booking_start < today:
+                        send_message(
+                            user_id,
+                            '❌ Дата не может быть в прошлом. Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ:'
+                        )
+                    elif booking_end > max_date:
                         send_message(
                             user_id,
                             f'❌ Бронь переговорки возможна не дальше чем на {BOOKING_ROOM_MAX_AHEAD_DAYS} суток от момента заявки (около 1 месяца).\n'
-                            f'Самая поздняя допустимая дата и время: {max_date.strftime("%d.%m.%Y %H:%M")}\n\n'
-                            'Введите другую дату и время (ДД.ММ.ГГГГ ЧЧ:ММ):'
+                            f'Самая поздняя допустимая дата и время окончания: {max_date.strftime("%d.%m.%Y %H:%M")}\n\n'
+                            'Введите другой диапазон (ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ):'
                         )
                     else:
-                        state['booking']['datetime'] = booking_datetime
+                        state['booking']['datetime_start'] = booking_start
+                        state['booking']['datetime_end'] = booking_end
                         send_message(
                             user_id,
                             '🖥️ Необходимо оборудование?',
                             keyboard=get_yes_no_keyboard()
                         )
                         state['step'] = 'booking_equipment_need'
-                except ValueError:
-                    send_message(user_id, '❌ Неверный формат. Используйте ДД.ММ.ГГГГ ЧЧ:ММ (например, 20.12.2025 14:30)')
+                except ValueError as e:
+                    if str(e) == 'end before start':
+                        send_message(
+                            user_id,
+                            '❌ Время окончания должно быть позже времени начала. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30):'
+                        )
+                    else:
+                        send_message(
+                            user_id,
+                            '❌ Неверный формат. Используйте ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30):'
+                        )
 
             elif state['step'] == 'booking_equipment_need':
                 if text_lower == 'да':
@@ -1503,23 +1570,26 @@ def main():
                     
                     # Сохраняем бронь в БД
                     try:
-                        equipment_str = booking.get('equipment', '')
-                        if isinstance(equipment_str, list):
-                            equipment_str = ', '.join(equipment_str)
-                        if not equipment_str:
-                            equipment_str = 'не требуется'
-                        
+                        equipment_str = format_booking_equipment(booking.get('equipment'))
+                        time_range = format_booking_time_range(
+                            booking['datetime_start'], booking['datetime_end']
+                        )
+
                         # Получаем ID переговорки из маппинга
                         room_id = room_name_to_id.get(text)
-                        
+
                         # Обновляем состояние диалога
                         if dialog_id:
-                            db.update_dialog_state(dialog_id, 'бронь_создана', f"Бронь: {booking['name']}")
-                        
+                            db.update_dialog_state(
+                                dialog_id,
+                                'бронь_создана',
+                                f"Бронь: {booking['name']}, {time_range}",
+                            )
+
                         заявка_id = db.add_room_booking(
                             vk_id=user_id,
                             название_мероприятия=booking['name'],
-                            дата_и_время=booking['datetime'].isoformat(),
+                            дата_и_время=booking['datetime_start'].isoformat(),
                             id_переговорки=room_id,
                             формат=booking.get('format', ''),
                             количество_человек=booking.get('people', 0),
@@ -1531,19 +1601,8 @@ def main():
                         print(f"⚠️ Ошибка сохранения брони в БД: {e}")
                         import traceback
                         traceback.print_exc()
-                    
-                    summary = f'''✅ Заявка на бронь переговорки принята!
 
-📋 Детали брони:
-• Мероприятие: {booking['name']}
-• Формат: {booking['format']}
-• Участников: {booking['people']}
-• Дата и время: {booking['datetime'].strftime('%d.%m.%Y %H:%M')}
-• Оборудование: {booking['equipment'] if booking['equipment'] else 'не требуется'}
-• Переговорка: {booking['room']}
-
-Спасибо за обращение!'''
-                    send_message(user_id, summary, keyboard=get_main_keyboard())
+                    send_message(user_id, build_room_booking_summary(booking), keyboard=get_main_keyboard())
                     reset_state(user_id)
                 else:
                     booking = state.get('booking', {})
