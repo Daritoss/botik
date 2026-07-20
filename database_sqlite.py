@@ -5,6 +5,7 @@
 
 import os
 import sqlite3
+import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -24,7 +25,10 @@ class SQLiteDatabase:
             db_path: Путь к файлу базы данных SQLite; по умолчанию — vk-botik.db в каталоге проекта
         """
         self.db_path = db_path if db_path is not None else DEFAULT_SQLITE_PATH
-        self.connection = None
+        # Соединение на поток: иначе main + поток статистики ломают друг друга
+        self._local = threading.local()
+        self._write_lock = threading.RLock()
+        self.connection = None  # совместимость: последнее соединение текущего потока
         self._ensure_tables()
         self._ensure_innovatika_room_row()
 
@@ -104,16 +108,35 @@ class SQLiteDatabase:
             conn.close()
 
     def connect(self) -> sqlite3.Connection:
-        """Открыть соединение с базой данных"""
-        self.connection = sqlite3.connect(self.db_path)
-        self.connection.row_factory = sqlite3.Row  # Результаты как словари
-        return self.connection
+        """Открыть соединение с БД в текущем потоке (безопасно при параллельных запросах)."""
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=30,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA busy_timeout = 30000')
+        self._local.connection = conn
+        self.connection = conn
+        return conn
     
     def close(self):
-        """Закрыть соединение с базой данных"""
-        if self.connection:
-            self.connection.commit()
-            self.connection.close()
+        """Закрыть соединение текущего потока"""
+        conn = getattr(self._local, 'connection', None)
+        if conn is None:
+            conn = self.connection
+        if conn is not None:
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if getattr(self._local, 'connection', None) is conn:
+            self._local.connection = None
+        if self.connection is conn:
             self.connection = None
     
     def __enter__(self):
@@ -594,50 +617,52 @@ class SQLiteDatabase:
     def update_daily_statistics(self):
         """Обновить ежедневную статистику"""
         conn = self.connect()
-        cursor = conn.cursor()
-        
-        today = datetime.now().date().isoformat()
-        
-        # Проверяем, есть ли уже запись за сегодня
-        cursor.execute('SELECT id_статистики FROM Статистика WHERE дата = ?', (today,))
-        exists = cursor.fetchone()
-        
-        # Считаем статистику за сегодня
-        cursor.execute('SELECT COUNT(*) FROM Заявка_на_служебку WHERE date(дата_подачи) = ?', (today,))
-        служебок = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM Заявки_на_переговорки WHERE date(дата_подачи) = ?', (today,))
-        броней = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM Заявка_на_медиапроект WHERE date(дата_подачи) = ?', (today,))
-        медиапроектов = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(DISTINCT vk_id) FROM Пользователь WHERE date(последняя_активность) = ?', (today,))
-        активных = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM История_сообщений WHERE date(время) = ?', (today,))
-        сообщений = cursor.fetchone()[0]
-        
-        if exists:
-            cursor.execute('''
-                UPDATE Статистика 
-                SET количество_служебок = ?,
-                    количество_броней = ?,
-                    количество_медиапроектов = ?,
-                    количество_активных_пользователей = ?,
-                    количество_сообщений = ?
-                WHERE дата = ?
-            ''', (служебок, броней, медиапроектов, активных, сообщений, today))
-        else:
-            cursor.execute('''
-                INSERT INTO Статистика 
-                (дата, количество_служебок, количество_броней, количество_медиапроектов,
-                 количество_активных_пользователей, количество_сообщений)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (today, служебок, броней, медиапроектов, активных, сообщений))
-        
-        conn.commit()
-        self.close()
+        try:
+            cursor = conn.cursor()
+
+            today = datetime.now().date().isoformat()
+
+            # Проверяем, есть ли уже запись за сегодня
+            cursor.execute('SELECT id_статистики FROM Статистика WHERE дата = ?', (today,))
+            exists = cursor.fetchone()
+
+            # Считаем статистику за сегодня
+            cursor.execute('SELECT COUNT(*) FROM Заявка_на_служебку WHERE date(дата_подачи) = ?', (today,))
+            служебок = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(*) FROM Заявки_на_переговорки WHERE date(дата_подачи) = ?', (today,))
+            броней = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(*) FROM Заявка_на_медиапроект WHERE date(дата_подачи) = ?', (today,))
+            медиапроектов = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(DISTINCT vk_id) FROM Пользователь WHERE date(последняя_активность) = ?', (today,))
+            активных = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(*) FROM История_сообщений WHERE date(время) = ?', (today,))
+            сообщений = cursor.fetchone()[0]
+
+            if exists:
+                cursor.execute('''
+                    UPDATE Статистика 
+                    SET количество_служебок = ?,
+                        количество_броней = ?,
+                        количество_медиапроектов = ?,
+                        количество_активных_пользователей = ?,
+                        количество_сообщений = ?
+                    WHERE дата = ?
+                ''', (служебок, броней, медиапроектов, активных, сообщений, today))
+            else:
+                cursor.execute('''
+                    INSERT INTO Статистика 
+                    (дата, количество_служебок, количество_броней, количество_медиапроектов,
+                     количество_активных_пользователей, количество_сообщений)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (today, служебок, броней, медиапроектов, активных, сообщений))
+
+            conn.commit()
+        finally:
+            self.close()
     
     def get_statistics(self, дней: int = 7) -> List[Dict[str, Any]]:
         """

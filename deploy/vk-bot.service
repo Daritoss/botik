@@ -1,0 +1,26 @@
+# Установка на сервере (Debian, пользователь devmaster, путь ~/botik):
+#
+#   sudo cp deploy/vk-bot.service /etc/systemd/system/vk-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable vk-bot
+#   sudo systemctl start vk-bot
+#   sudo systemctl status vk-bot
+#
+# Лог: journalctl -u vk-bot -f
+
+[Unit]
+Description=VK Bot botik (Long Poll)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=devmaster
+WorkingDirectory=/home/devmaster/botik
+Environment=PYTHONUTF8=1
+ExecStart=/home/devmaster/botik/venv/bin/python -u run_server.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

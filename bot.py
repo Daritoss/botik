@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import json
+import traceback
 
 import requests
 import urllib3.exceptions
@@ -161,6 +162,10 @@ BOOKING_ROOM_MAX_AHEAD_DAYS = 30
 
 # Пауза между превью залов (ВК режет частые сообщения одному peer — без паузы long poll «замирает»)
 MEETING_ROOM_PREVIEW_DELAY_SEC = 0.4
+
+# Long Poll: пауза при сбоях (экспоненциальный рост до максимума)
+LONGPOLL_RETRY_INITIAL_SEC = 5
+LONGPOLL_RETRY_MAX_SEC = 120
 
 # Функции для создания клавиатур
 def get_start_keyboard():
@@ -559,7 +564,7 @@ def get_filtered_rooms_keyboard(people_count):
 #     return keyboard.get_keyboard()
 
 def send_message(user_id, message, keyboard=None, log_response=True):
-    """Отправка сообщения с клавиатурой. При ошибке 912 (чат-бот не включён в настройках ВК) — без клавиатуры."""
+    """Отправка сообщения с клавиатурой. При ошибке 912 — без клавиатуры. Ошибки VK не роняют процесс."""
     rid = random.randint(0, 2**31)
     try:
         vk.messages.send(
@@ -575,18 +580,39 @@ def send_message(user_id, message, keyboard=None, log_response=True):
                 '⚠️ VK API 912: клавиатуры недоступны. В Управление → Сообщения → Настройки для бота '
                 'включите возможности чат-бота. Пока отправляю сообщение без клавиатуры.'
             )
-            vk.messages.send(
-                user_id=user_id,
-                message=message,
-                random_id=random.randint(0, 2**31)
-            )
+            try:
+                vk.messages.send(
+                    user_id=user_id,
+                    message=message,
+                    random_id=random.randint(0, 2**31)
+                )
+            except Exception as e2:
+                print(f'⚠️ Повторная отправка без клавиатуры не удалась: {e2}')
+                return False
+        elif e.code == 6:
+            time.sleep(0.7)
+            try:
+                vk.messages.send(
+                    user_id=user_id,
+                    message=message,
+                    keyboard=keyboard,
+                    random_id=random.randint(0, 2**31)
+                )
+            except Exception as e2:
+                print(f'⚠️ VK API flood retry failed: {e2}')
+                return False
         else:
-            raise
+            print(f'⚠️ VK API {e.code}: {e}')
+            return False
+    except Exception as e:
+        print(f'⚠️ Ошибка отправки сообщения: {e}')
+        return False
     if log_response:
         try:
             db.log_message(user_id, "", message, user_states.get(user_id, {}).get('step', 'unknown'))
         except Exception:
             pass
+    return True
 
 def _attachment_from_docs_save(saved):
     """Строка attachment для messages.send из ответа docs.save / VkUpload.document."""
@@ -701,11 +727,11 @@ def send_photo(user_id, photo_path, message=""):
                 )
                 return True
             except vk_api.exceptions.ApiError as e:
-                # 6 — слишком много запросов в секунду; иначе long poll и очередь сообщений подвисают
                 if e.code == 6 and attempt < 3:
                     time.sleep(0.6 + attempt * 0.4)
                     continue
-                raise
+                print(f'⚠️ Ошибка VK API при отправке фото ({e.code}): {e}')
+                return False
     except Exception as e:
         print(f"❌ Ошибка отправки фото (документом): {e}")
         import traceback
@@ -847,1132 +873,1240 @@ def update_statistics_periodically():
         try:
             time.sleep(3600)  # Обновляем каждый час
             db.update_daily_statistics()
-            print("📊 Статистика обновлена")
+            print("📊 Статистика обновлена", flush=True)
         except Exception as e:
-            print(f"⚠️ Ошибка обновления статистики: {e}")
+            print(f"⚠️ Ошибка обновления статистики: {e}", flush=True)
+
+
+_stats_thread_started = False
+_stats_thread_lock = threading.Lock()
+
+
+def recreate_longpoll():
+    """Пересоздать Long Poll после сетевых/API сбоев."""
+    global longpoll
+    longpoll = VkBotLongPoll(vk_session, GROUP_ID)
+    print('🔄 Long Poll переподключён', flush=True)
 
 
 def vk_events():
-    """События Long Poll с автоповтором при обрыве сети (WinError 10054, ProtocolError и т.п.)."""
+    """События Long Poll с автоповтором при обрыве сети и ошибках VK API."""
+    retry_delay = LONGPOLL_RETRY_INITIAL_SEC
     while True:
         try:
-            yield from longpoll.listen()
+            # for + yield надёжнее, чем yield from: исключения из listen() ловятся здесь
+            for event in longpoll.listen():
+                retry_delay = LONGPOLL_RETRY_INITIAL_SEC
+                yield event
         except requests.exceptions.RequestException as e:
-            print(f"⚠️ Long Poll (сеть/HTTP): {e}. Повтор через 5 с...")
-            time.sleep(5)
+            print(f'⚠️ Long Poll (сеть/HTTP): {e}. Повтор через {retry_delay} с...', flush=True)
         except urllib3.exceptions.ProtocolError as e:
-            print(f"⚠️ Long Poll (обрыв соединения): {e}. Повтор через 5 с...")
-            time.sleep(5)
+            print(f'⚠️ Long Poll (обрыв соединения): {e}. Повтор через {retry_delay} с...', flush=True)
         except (ConnectionError, OSError) as e:
-            print(f"⚠️ Long Poll (сокет): {e}. Повтор через 5 с...")
-            time.sleep(5)
+            print(f'⚠️ Long Poll (сокет): {e}. Повтор через {retry_delay} с...', flush=True)
         except json.JSONDecodeError as e:
-            print(f"⚠️ Long Poll: некорректный ответ API. Повтор через 5 с... ({e})")
-            time.sleep(5)
+            print(f'⚠️ Long Poll: некорректный ответ API ({e}). Повтор через {retry_delay} с...', flush=True)
+        except vk_api.exceptions.ApiHttpError as e:
+            print(f'⚠️ Long Poll (HTTP API): {e}. Повтор через {retry_delay} с...', flush=True)
+        except vk_api.exceptions.ApiError as e:
+            print(f'⚠️ Long Poll (VK API {getattr(e, "code", "?")}): {e}. Повтор через {retry_delay} с...', flush=True)
+        except vk_api.exceptions.VkApiError as e:
+            print(f'⚠️ Long Poll (VkApiError): {e}. Повтор через {retry_delay} с...', flush=True)
+        except Exception as e:
+            print(f'⚠️ Long Poll (неожиданная ошибка): {e}. Повтор через {retry_delay} с...', flush=True)
+            traceback.print_exc()
+        time.sleep(retry_delay)
+        retry_delay = min(int(retry_delay * 1.5) + 1, LONGPOLL_RETRY_MAX_SEC)
+        try:
+            recreate_longpoll()
+        except Exception as re_err:
+            print(f'⚠️ Не удалось переподключить Long Poll: {re_err}', flush=True)
 
 
-def main():
-    print("🤖 Бот запущен и слушает события...")
-    
-    # Запускаем поток для обновления статистики
-    stats_thread = threading.Thread(target=update_statistics_periodically, daemon=True)
-    stats_thread.start()
-    print("📊 Поток обновления статистики запущен")
-    
-    for event in vk_events():
-        if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
-            message = event.message
-            user_id = message['from_id']
-            text = (message.get('text') or '').strip()
-            text_lower = text.lower()
+def _message_as_dict(message):
+    """Нормализовать объект сообщения VK к обычному dict."""
+    if message is None:
+        return {}
+    if isinstance(message, dict):
+        return message
+    try:
+        return dict(message)
+    except Exception:
+        out = {}
+        for key in ('from_id', 'text', 'attachments', 'peer_id', 'id'):
+            if hasattr(message, key):
+                out[key] = getattr(message, key)
+        return out
 
-            print(f"📩 Сообщение от {user_id}: {text}")
 
-            # Получить информацию о пользователе и сохранить в БД
-            try:
-                user_info = vk.users.get(user_ids=user_id)[0]
-                db.add_user(user_id, user_info.get('first_name'), user_info.get('last_name'))
-            except:
-                db.add_user(user_id)
+def handle_incoming_message(message):
+    """Обработка одного входящего сообщения (ошибка здесь не роняет весь процесс)."""
+    message = _message_as_dict(message)
+    user_id = message.get('from_id')
+    if not user_id:
+        print('⚠️ Сообщение без from_id, пропуск', flush=True)
+        return
+    text = (message.get('text') or '').strip()
+    text_lower = text.lower()
 
-            # Инициализация состояния пользователя
-            if user_id not in user_states:
-                user_states[user_id] = {'step': 'start'}
-            
-            # Создаем или получаем диалог для пользователя
-            if 'dialog_id' not in user_states[user_id]:
-                dialog_id = db.create_dialog(user_id, 'active')
-                user_states[user_id]['dialog_id'] = dialog_id
-                print(f"✅ Создан диалог ID: {dialog_id} для пользователя {user_id}")
-            
-            # Логируем входящее сообщение от пользователя
-            try:
-                db.log_message(user_id, text, None, user_states[user_id].get('step', 'unknown'))
-            except Exception as e:
-                print(f"⚠️ Ошибка логирования входящего сообщения: {e}")
+    print(f"📩 Сообщение от {user_id}: {text}", flush=True)
 
-            state = user_states[user_id]
+    # Получить информацию о пользователе и сохранить в БД
+    try:
+        user_info = vk.users.get(user_ids=user_id)[0]
+        db.add_user(user_id, user_info.get('first_name'), user_info.get('last_name'))
+    except Exception:
+        try:
+            db.add_user(user_id)
+        except Exception as e:
+            print(f'⚠️ Не удалось сохранить пользователя: {e}', flush=True)
 
-            # Режим «иной вопрос»: бот не отвечает, пока пользователь не напишет «начать»
-            if state['step'] == 'other_question_silent':
-                if text_lower == 'начать' or '🚀 начать' in text_lower:
-                    reset_state(user_id)
-                    send_message(
-                        user_id,
-                        '👋 Добро пожаловать! Выберите нужную услугу:',
-                        keyboard=get_main_keyboard()
-                    )
-                continue
-            
-            # Универсальная обработка кнопки "Главное меню" для всех состояний
-            if ('🏠' in text or 'главное меню' in text_lower) and state['step'] != 'start':
+    # Инициализация состояния пользователя
+    if user_id not in user_states:
+        user_states[user_id] = {'step': 'start'}
+
+    # Создаем или получаем диалог для пользователя
+    if 'dialog_id' not in user_states[user_id]:
+        try:
+            dialog_id = db.create_dialog(user_id, 'active')
+            user_states[user_id]['dialog_id'] = dialog_id
+            print(f"✅ Создан диалог ID: {dialog_id} для пользователя {user_id}", flush=True)
+        except Exception as e:
+            print(f'⚠️ Не удалось создать диалог: {e}', flush=True)
+
+    # Логируем входящее сообщение от пользователя
+    try:
+        db.log_message(user_id, text, None, user_states[user_id].get('step', 'unknown'))
+    except Exception as e:
+        print(f"⚠️ Ошибка логирования входящего сообщения: {e}")
+
+    state = user_states[user_id]
+
+    # Режим «иной вопрос»: бот не отвечает, пока пользователь не напишет «начать»
+    if state['step'] == 'other_question_silent':
+        if text_lower == 'начать' or '🚀 начать' in text_lower:
+            reset_state(user_id)
+            send_message(
+                user_id,
+                '👋 Добро пожаловать! Выберите нужную услугу:',
+                keyboard=get_main_keyboard()
+            )
+        return
+
+    # Универсальная обработка кнопки "Главное меню" для всех состояний
+    if ('🏠' in text or 'главное меню' in text_lower) and state['step'] != 'start':
+        reset_state(user_id)
+        send_message(
+            user_id,
+            '👋 Главное меню:',
+            keyboard=get_main_keyboard()
+        )
+        return
+
+    # Универсальная обработка кнопки "Назад" для всех состояний  
+    if ('⬅️' in text and 'назад' in text_lower) or text_lower == 'назад':
+        if state['step'] != 'start':
+            prev_step = get_navigation_state(state['step'])
+            if prev_step == 'start':
                 reset_state(user_id)
                 send_message(
                     user_id,
                     '👋 Главное меню:',
                     keyboard=get_main_keyboard()
                 )
-                continue
-
-            # Универсальная обработка кнопки "Назад" для всех состояний  
-            if ('⬅️' in text and 'назад' in text_lower) or text_lower == 'назад':
-                if state['step'] != 'start':
-                    prev_step = get_navigation_state(state['step'])
-                    if prev_step == 'start':
-                        reset_state(user_id)
-                        send_message(
-                            user_id,
-                            '👋 Главное меню:',
-                            keyboard=get_main_keyboard()
-                        )
-                    else:
-                        state['step'] = prev_step
-                        # Отправляем соответствующее сообщение для предыдущего шага
-                        if prev_step == 'choose_service_type':
-                            send_message(
-                                user_id,
-                                '📝 Выберите тип документа:',
-                                keyboard=get_service_type_keyboard()
-                            )
-                        elif prev_step == 'booking_menu':
-                            send_message(
-                                user_id,
-                                '🏢 Выберите интересующий пункт:',
-                                keyboard=get_booking_menu_keyboard()
-                            )
-                        elif prev_step == 'booking_name':
-                            send_message(user_id, '🏢 Введите название мероприятия:')
-                        elif prev_step == 'booking_format':
-                            send_message(
-                                user_id,
-                                '🎯 Выберите формат мероприятия:',
-                                keyboard=get_booking_format_keyboard()
-                            )
-                        elif prev_step == 'booking_capacity':
-                            send_message(user_id, '👥 Введите количество участников (число):')
-                        elif prev_step == 'ps_date':
-                            send_message(user_id, '🎮 Введите желаемую дату в формате ДД.ММ.ГГГГ:')
-                        elif prev_step == 'ps_time':
-                            available_times = state.get('ps', {}).get('available_times', [])
-                            send_message(
-                                user_id,
-                                '🕒 Выберите время начала (доступные слоты):',
-                                keyboard=get_ps_time_keyboard(available_times)
-                            )
-                        elif prev_step == 'ps_menu':
-                            send_message(
-                                user_id,
-                                '🎮 Бронирование PlayStation\n\nБронь доступна только на неделю вперед и только на 1 час. Продление — на месте у администратора.\n\nВыберите действие:',
-                                keyboard=get_ps_menu_keyboard()
-                            )
-                        elif prev_step == 'ps_cancel_date':
-                            send_message(user_id, '❌ Введите дату брони для отмены (ДД.ММ.ГГГГ):')
-                        # elif prev_step == 'media_confirm':
-                        #     send_message(
-                        #         user_id,
-                        #         '🎬 Ознакомьтесь с критериями отбора медиапроектов.\n\nПодтвердите прочтение:',
-                        #         keyboard=get_yes_no_keyboard()
-                        #     )
-                continue
-
-            # НАЧАЛЬНОЕ СОСТОЯНИЕ - показываем стартовую клавиатуру при первом входе
-            if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен', 'проект', 'башн', 'иной', 'вопрос', 'проектная']):
-                send_message(
-                    user_id,
-                    '👋 Добро пожаловать в бот Башни Политеха!\n\nНажмите "Начать" для работы с ботом:',
-                    keyboard=get_start_keyboard()
-                )
-                continue
-
-            # ГЛАВНОЕ МЕНЮ 
-            if state['step'] == 'start':
-                if text_lower in ['начать', '🚀', 'start', 'привет', 'меню'] or '🚀 начать' in text_lower:
-                    send_message(
-                        user_id,
-                        '👋 Добро пожаловать! Выберите нужную услугу:',
-                        keyboard=get_main_keyboard()
-                    )
-                elif '📝' in text or 'служебн' in text_lower:
+            else:
+                state['step'] = prev_step
+                # Отправляем соответствующее сообщение для предыдущего шага
+                if prev_step == 'choose_service_type':
                     send_message(
                         user_id,
                         '📝 Выберите тип документа:',
                         keyboard=get_service_type_keyboard()
                     )
-                    state['step'] = 'choose_service_type'
-                    continue
-                elif '📨' in text or ('письмо' in text_lower and 'поддержк' in text_lower):
-                    send_message(
-                        user_id,
-                        instructions['письмо поддержки'],
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['service_type'] = 'письмо поддержки'
-                    state['step'] = 'support_letter_confirm'
-                elif '🌍' in text or 'поездк' in text_lower:
-                    send_message(
-                        user_id,
-                        instructions['поездка'] + '\n\nВсё понятно? Остались вопросы?',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'trip_questions'
-                    continue
-                elif '🏢' in text or 'бронь' in text_lower or 'переговорк' in text_lower:
-                    send_message(
-                        user_id,
-                        '🏢 Добро пожаловать в раздел бронирования аудиторий Башни Политех!\n\nЗдесь вы сможете подобрать помещение для своего мероприятия и узнать все правила. Выберите интересующий пункт меню:',
-                        keyboard=get_booking_menu_keyboard()
-                    )
-                    state['step'] = 'booking_menu'
-                    continue
-                elif '🎮' in text or 'playstation' in text_lower or 'плейстейшн' in text_lower or 'плейстейшен' in text_lower or 'ps' == text_lower:
-                    send_message(
-                        user_id,
-                        '🎮 Бронирование PlayStation\n\nБронь доступна только на неделю вперед и только на 1 час. Продление — на месте у администратора.\n\n⏰ Время работы: будни с 09:30 до 20:30\n\nВыберите действие:',
-                        keyboard=get_ps_menu_keyboard()
-                    )
-                    state['step'] = 'ps_menu'
-                    state['ps'] = {}
-                    continue
-                elif text == PROJECT_START_BUTTON or 'проектная среда' in text_lower:
-                    send_message(
-                        user_id,
-                        PROJECT_START_INTRO,
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'project_start_confirm'
-                    continue
-                elif text == OTHER_QUESTION_BUTTON or 'иной вопрос' in text_lower:
-                    send_message(
-                        user_id,
-                        '✍️ Напишите интересующий вас вопрос — администратор Башни увидит его в этом чате и ответит.\n\n'
-                        'Чтобы снова пользоваться меню бота, напишите «начать».'
-                    )
-                    state['step'] = 'other_question_silent'
-                    continue
-                # elif '🎬' in text or 'медиа' in text_lower:
-                #     send_message(
-                #         user_id,
-                #         '🎬 Ознакомьтесь с критериями отбора медиапроектов.\n\nПодтвердите прочтение:',
-                #         keyboard=get_yes_no_keyboard()
-                #     )
-                #     state['step'] = 'confirm_criteria'
-                #     state['media'] = {}
-                #     continue
-                else:
-                    send_message(
-                        user_id,
-                        '👋 Выберите услугу из меню:',
-                        keyboard=get_main_keyboard()
-                    )
-
-            # СЛУЖЕБНЫЕ ЗАПИСКИ
-            elif state['step'] == 'choose_service_type':
-                if text_lower == 'аудитория':
-                    state['service_type'] = text_lower
-                    send_message(
-                        user_id,
-                        '❓ Согласовано ли бронирование аудитории? (128 ауд. ГЗ, каб. В.1.15 НИК, ответственные за корпуса)',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'auditorium_approved'
-                elif text_lower == 'освобождение':
-                    state['service_type'] = text_lower
-                    send_message(
-                        user_id,
-                        '❓ Есть ли официальная причина освобождения? (Мероприятие в Календарном плане, Письмо приглашение и т.д.)',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'release_reason'
-                elif text_lower == 'пропуск':
-                    state['service_type'] = text_lower
-                    send_message(
-                        user_id,
-                        instructions[text_lower] + '\n\n✅ Ознакомились с инструкцией?',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'confirm_instruction'
-                elif '📨' in text or ('письмо' in text_lower and 'поддержк' in text_lower):
-                    send_message(
-                        user_id,
-                        instructions['письмо поддержки'],
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['service_type'] = 'письмо поддержки'
-                    state['step'] = 'support_letter_confirm'
-                elif '🌍' in text or 'поездк' in text_lower:
-                    send_message(
-                        user_id,
-                        instructions['поездка'] + '\n\nВсё понятно? Остались вопросы?',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'trip_questions'
-                else:
-                    send_message(
-                        user_id,
-                        '❌ Пожалуйста, выберите тип из списка:',
-                        keyboard=get_service_type_keyboard()
-                    )
-
-            # Обработка начальных вопросов для аудитории
-            elif state['step'] == 'auditorium_approved':
-                if text_lower == 'да':
-                    send_message(
-                        user_id,
-                        instructions['аудитория'] + '\n\n✅ Ознакомились с инструкцией?',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'confirm_instruction'
-                elif text_lower == 'нет':
-                    send_message(
-                        user_id,
-                        '❌ Перед оформлением служебной записки необходимо забронировать аудиторию',
-                        keyboard=get_main_keyboard()
-                    )
-                    reset_state(user_id)
-                else:
-                    send_message(
-                        user_id,
-                        '❌ Ответьте "Да" или "Нет":',
-                        keyboard=get_yes_no_keyboard()
-                    )
-
-            # Обработка начальных вопросов для освобождения
-            elif state['step'] == 'release_reason':
-                if text_lower == 'да':
-                    send_message(
-                        user_id,
-                        instructions['освобождение'] + '\n\n✅ Ознакомились с инструкцией?',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                    state['step'] = 'confirm_instruction'
-                elif text_lower == 'нет':
-                    send_message(
-                        user_id,
-                        '❌ Перед оформлением служебной записки необходимо получить официальную причину освобождения',
-                        keyboard=get_main_keyboard()
-                    )
-                    reset_state(user_id)
-                else:
-                    send_message(
-                        user_id,
-                        '❌ Ответьте "Да" или "Нет":',
-                        keyboard=get_yes_no_keyboard()
-                    )
-
-            # Обработка письма поддержки
-            elif state['step'] == 'support_letter_confirm':
-                if text_lower == 'да':
-                    # Отправляем шаблон письма поддержки после подтверждения
-                    template_file = templates.get('письмо поддержки')
-                    if template_file and os.path.exists(template_file):
-                        send_document(user_id, template_file)
-                    
-                    send_message(
-                        user_id,
-                        '✅ Шаблон отправлен! Пожалуйста, заполните его и направьте специалисту.',
-                        keyboard=get_main_keyboard()
-                    )
-                    reset_state(user_id)
-                elif text_lower == 'нет':
-                    send_message(
-                        user_id,
-                        '❌ Пожалуйста, ознакомьтесь с инструкцией и подтвердите:',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                else:
-                    send_message(
-                        user_id,
-                        '❌ Ответьте "Да" или "Нет":',
-                        keyboard=get_yes_no_keyboard()
-                    )
-
-            elif state['step'] == 'project_start_confirm':
-                if text_lower == 'да':
-                    if os.path.exists(PROJECT_START_FILE):
-                        if send_document(
-                            user_id,
-                            PROJECT_START_FILE,
-                            message='📎 Инструкция по участию в проектной среде.',
-                            keyboard=get_main_keyboard(),
-                        ):
-                            reset_state(user_id)
-                        else:
-                            send_message(
-                                user_id,
-                                '❌ Не удалось отправить файл. Попробуйте нажать «Да» ещё раз.',
-                                keyboard=get_yes_no_keyboard(),
-                            )
-                    else:
-                        send_message(
-                            user_id,
-                            '❌ Файл инструкции не найден. Обратитесь к администратору.',
-                            keyboard=get_main_keyboard(),
-                        )
-                        reset_state(user_id)
-                elif text_lower == 'нет':
-                    send_message(
-                        user_id,
-                        PROJECT_START_INTRO,
-                        keyboard=get_yes_no_keyboard(),
-                    )
-                else:
-                    send_message(
-                        user_id,
-                        '❌ Ответьте «Да», чтобы получить инструкцию, или «Нет»:',
-                        keyboard=get_yes_no_keyboard(),
-                    )
-
-            # Обработка поездки
-            elif state['step'] == 'trip_questions':
-                if text_lower == 'нет':
-                    send_message(
-                        user_id,
-                        '✅ Отлично! Оформляйте заявки через КИС.',
-                        keyboard=get_main_keyboard()
-                    )
-                    reset_state(user_id)
-                elif text_lower == 'да':
-                    send_message(
-                        user_id,
-                        'ℹ️ Обратитесь с вопросами к специалисту: https://vk.com/nataleeeeeeeeshka',
-                        keyboard=get_main_keyboard()
-                    )
-                    reset_state(user_id)
-                else:
-                    send_message(
-                        user_id,
-                        '❌ Ответьте "Да" или "Нет":',
-                        keyboard=get_yes_no_keyboard()
-                    )
-
-            elif state['step'] == 'confirm_instruction':
-                if text_lower == 'да':
-                    state['service_data'] = {}  # Инициализация словаря для данных служебки
-                    # Шаблоны и вложения для пропуска отправляются только после принятой даты (см. enter_date)
-                    send_message(user_id, '📅 Введите дату служебки в формате ДД.ММ.ГГГГ:')
-                    state['step'] = 'enter_date'
-                elif text_lower == 'нет':
-                    send_message(
-                        user_id,
-                        '❌ Пожалуйста, ознакомьтесь с инструкцией и подтвердите:',
-                        keyboard=get_yes_no_keyboard()
-                    )
-                else:
-                    send_message(
-                        user_id,
-                        '❌ Ответьте "Да" или "Нет":',
-                        keyboard=get_yes_no_keyboard()
-                    )
-
-            elif state['step'] == 'enter_date':
-                try:
-                    date_raw = text.replace(',', '.').replace('/', '.').strip()
-                    date = datetime.datetime.strptime(date_raw, '%d.%m.%Y').date()
-                    today = datetime.date.today()
-                    days_diff = (date - today).days
-                    date_display = date.strftime('%d.%m.%Y')
-                    
-                    # Валидация: минимум 3 дня, максимум 2 месяца (60 дней)
-                    if days_diff < 3:
-                        send_message(
-                            user_id,
-                            f'❌ Заявка отклонена!\n\nДата должна быть минимум за 3 дня от сегодняшней.\nУказанная дата: {date_display}\nДо даты осталось дней: {days_diff}',
-                            keyboard=get_main_keyboard()
-                        )
-                        reset_state(user_id)
-                    elif days_diff > 60:
-                        max_date = today + datetime.timedelta(days=60)
-                        send_message(
-                            user_id,
-                            f'❌ Заявка отклонена!\n\nСлужебную записку можно сформировать только на ближайшие 2 месяца.\nМаксимальная доступная дата: {max_date.strftime("%d.%m.%Y")}',
-                            keyboard=get_main_keyboard()
-                        )
-                        reset_state(user_id)
-                    else:
-                        # Сохраняем дату в состоянии
-                        if 'service_data' not in state:
-                            state['service_data'] = {}
-                        state['service_data']['date'] = date_display
-                        
-                        service_type = state.get('service_type')
-                        if service_type == 'пропуск':
-                            consent_file = os.path.join(SCRIPT_DIR, 'templates', 'СОГЛАСИЕ НА ОБРАБОТКУ (2).DOC')
-                            if os.path.exists(consent_file):
-                                send_document(user_id, consent_file)
-                            participants_file = os.path.join(SCRIPT_DIR, 'templates', 'Шаблон_Участники (2).xlsx')
-                            if os.path.exists(participants_file):
-                                send_document(user_id, participants_file)
-
-                        template_file = templates.get(service_type)
-                        
-                        if template_file and os.path.exists(template_file):
-                            if send_document(user_id, template_file):
-                                send_message(
-                                    user_id,
-                                    f'✅ Дата принята: {date_display}\n\n📎 Заполните шаблон и отправьте файл в ответ.'
-                                )
-                                state['step'] = 'wait_file'
-                            else:
-                                send_message(
-                                    user_id,
-                                    '❌ Дата принята, но файл шаблона не удалось отправить (ошибка ВКонтакте при загрузке). '
-                                    'Попробуйте отправить ту же дату ещё раз через минуту. Если не поможет — напишите администратору.',
-                                    keyboard=get_main_keyboard(),
-                                )
-                        else:
-                            send_message(user_id, '❌ Шаблон не найден. Обратитесь к администратору.')
-                            reset_state(user_id)
-                except ValueError:
-                    send_message(user_id, '❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ (например, 20.12.2025)')
-
-            elif state['step'] == 'wait_file':
-                if 'attachments' in message and message['attachments']:
-                    # Валидация формата файла
-                    attachment = message['attachments'][0]
-                    if attachment['type'] == 'doc':
-                        doc = attachment['doc']
-                        file_ext = doc.get('ext', '').lower()
-                        allowed_formats = ['txt', 'docx', 'doc', 'pdf']
-                        
-                        if file_ext not in allowed_formats:
-                            send_message(
-                                user_id,
-                                f'❌ Недопустимый формат файла: .{file_ext}\n\nРазрешенные форматы: {", ".join(allowed_formats)}\n\nПожалуйста, отправьте файл в правильном формате.'
-                            )
-                            continue
-                    
-                    # Помечаем беседу как важную для проверяющих
-                    try:
-                        vk.messages.markAsImportantConversation(
-                            peer_id=user_id,
-                            important=1
-                        )
-                        print(f"📌 Диалог с пользователем {user_id} помечен как важный")
-                    except Exception as e:
-                        print(f"⚠️ Не удалось пометить диалог как важный: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    
-                    # Сохраняем заявку в БД
-                    заявка_id = None
-                    try:
-                        service_type = state.get('service_type')
-                        service_data = state.get('service_data', {})
-                        service_id = service_type_ids.get(service_type, 1)
-                        date_str = service_data.get('date', '')
-                        dialog_id = state.get('dialog_id')
-                        
-                        # Преобразуем дату в ISO формат
-                        if date_str:
-                            date_obj = datetime.datetime.strptime(date_str, '%d.%m.%Y')
-                            date_iso = date_obj.isoformat()
-                        else:
-                            date_iso = datetime.datetime.now().isoformat()
-                        
-                        # Обновляем состояние диалога
-                        if dialog_id:
-                            db.update_dialog_state(dialog_id, 'служебка_обработана', f"Служебка: {service_type}")
-                        
-                        # Сохраняем в БД
-                        заявка_id = db.add_service_note(
-                            vk_id=user_id,
-                            id_служебки=service_id,
-                            дата_мероприятия=date_iso,
-                            id_диалога=dialog_id,
-                            комментарии=f"Тип: {service_type}"
-                        )
-                        print(f"✅ Служебка сохранена в БД с ID: {заявка_id}, диалог: {dialog_id}")
-                        
-                        # Сохраняем документ в БД и связываем с заявкой
-                        doc_id = process_document(
-                            user_id=user_id,
-                            attachment=attachment,
-                            тип_документа='служебка',
-                            id_заявки=заявка_id
-                        )
-                        
-                        if doc_id:
-                            print(f"✅ Документ #{doc_id} связан с заявкой #{заявка_id}")
-                        
-                    except Exception as e:
-                        print(f"⚠️ Ошибка сохранения служебки в БД: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    
-                    send_message(
-                        user_id,
-                        '✅ Служебная записка принята и взята в работу!\n\nВаш запрос обрабатывается. Результат будет отправлен в течение 2-3 рабочих дней.\n\nСпасибо за обращение!',
-                        keyboard=get_main_keyboard()
-                    )
-                    reset_state(user_id)
-                else:
-                    send_message(user_id, '❌ Пожалуйста, отправьте заполненный файл.')
-
-            # БРОНЬ ПЕРЕГОВОРОК - МЕНЮ
-            elif state['step'] == 'booking_menu':
-                if 'правила' in text_lower or '📋' in text:
-                    send_message(
-                        user_id,
-                        '📋 Правила и время работы\n\n'
-                        'Кто может бронировать?\n'
-                        'Бронировать наши помещения могут Институты и подразделения СПбПУ, студенты и студенческие объединения, а также партнёры нашего Университета, которые имеют заверенный статус и ответственное лицо из числа работников. В других случаях — по согласованию с администрацией.\n\n'
-                        '⏰ Часы работы:\n'
-                        'По будням с 09:30 до 20:30. Завершение программы — не позднее 20:20.\n\n'
-                        '📝 Правила регистрации:\n'
-                        '• Бронирование — не позднее чем за 30 календарных дней до события\n'
-                        f'• Дата и время мероприятия в боте — не позднее чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с момента заявки\n'
-                        '• Обязательна регистрация в Leader-ID минимум за 24 часа до начала. Без активной страницы события бронь аннулируется\n'
-                        '• Каждый участник должен иметь профиль в Leader-ID; у стойки — скан персонального QR-кода\n'
-                        '• Мультимедийное оборудование — по запросу через администратора или технического специалиста\n\n'
-                        'Спасибо, что планируете мероприятия с нами. Ждём вас в Башне!',
-                        keyboard=get_booking_menu_keyboard()
-                    )
-                elif 'забронировать' in text_lower or '📅' in text:
-                    send_message(user_id, '🏢 Введите название мероприятия:')
-                    state['step'] = 'booking_name'
-                    state['booking'] = {}
-                else:
+                elif prev_step == 'booking_menu':
                     send_message(
                         user_id,
                         '🏢 Выберите интересующий пункт:',
                         keyboard=get_booking_menu_keyboard()
                     )
-
-            elif state['step'] == 'booking_name':
-                # Валидация: название не может состоять только из цифр
-                if text.isdigit():
-                    send_message(user_id, '❌ Название мероприятия не может состоять только из цифр. Пожалуйста, введите корректное название:')
-                else:
-                    state['booking']['name'] = text
-                    send_message(user_id, '📋 Укажите формат мероприятия:', keyboard=get_booking_format_keyboard())
-                    state['step'] = 'booking_format'
-
-            elif state['step'] == 'booking_format':
-                if text_lower == 'свой вариант':
-                    send_message(user_id, '📝 Введите свой формат мероприятия:')
-                    state['step'] = 'booking_format_custom'
-                else:
-                    state['booking']['format'] = text
-                    send_message(user_id, '👥 Укажите количество участников:')
-                    state['step'] = 'booking_people'
-
-            elif state['step'] == 'booking_format_custom':
-                state['booking']['format'] = text
-                send_message(user_id, '👥 Укажите количество участников:')
-                state['step'] = 'booking_people'
-
-            elif state['step'] == 'booking_people':
-                try:
-                    people_count = parse_participants_count(text)
-                    if people_count < 1:
-                        send_message(user_id, '❌ Укажите число участников не меньше 1.')
-                        continue
-                    state['booking']['people'] = people_count
-                    
-                    filtered_keyboard, suitable_rooms = get_filtered_rooms_keyboard(people_count)
-                    
-                    if suitable_rooms:
-                        send_message(
-                            user_id,
-                            f'🏢 Для {people_count} чел. показаны переговорки, которые по правилам можно забронировать при таком числе участников:'
-                        )
-                        send_meeting_room_previews(user_id, suitable_rooms)
-                        
-                        send_message(
-                            user_id,
-                            '🕒 Введите дату и время начала и окончания мероприятия в формате '
-                            'ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30).\n'
-                            f'Дата не может быть позже чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с текущего момента.'
-                        )
-                        state['step'] = 'booking_datetime'
-                        state['suitable_rooms'] = suitable_rooms  # Сохраняем список подходящих переговорок
-                    else:
-                        send_message(
-                            user_id,
-                            '❌ Нет переговорки под это число участников (в боте доступны залы до 100 человек по правилам каждого зала).\n\n👥 Укажите другое число участников:'
-                        )
-                except ValueError:
-                    send_message(user_id, '❌ Введите корректное число участников.')
-
-            elif state['step'] == 'booking_datetime':
-                try:
-                    booking_start, booking_end = parse_booking_datetime_range(text)
-                    today = datetime.datetime.now()
-                    max_date = today + datetime.timedelta(days=BOOKING_ROOM_MAX_AHEAD_DAYS)
-
-                    if booking_start < today:
-                        send_message(
-                            user_id,
-                            '❌ Дата не может быть в прошлом. Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ:'
-                        )
-                    elif booking_end > max_date:
-                        send_message(
-                            user_id,
-                            f'❌ Бронь переговорки возможна не дальше чем на {BOOKING_ROOM_MAX_AHEAD_DAYS} суток от момента заявки (около 1 месяца).\n'
-                            f'Самая поздняя допустимая дата и время окончания: {max_date.strftime("%d.%m.%Y %H:%M")}\n\n'
-                            'Введите другой диапазон (ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ):'
-                        )
-                    else:
-                        state['booking']['datetime_start'] = booking_start
-                        state['booking']['datetime_end'] = booking_end
-                        send_message(
-                            user_id,
-                            '🖥️ Необходимо оборудование?',
-                            keyboard=get_yes_no_keyboard()
-                        )
-                        state['step'] = 'booking_equipment_need'
-                except ValueError as e:
-                    if str(e) == 'end before start':
-                        send_message(
-                            user_id,
-                            '❌ Время окончания должно быть позже времени начала. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30):'
-                        )
-                    else:
-                        send_message(
-                            user_id,
-                            '❌ Неверный формат. Используйте ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30):'
-                        )
-
-            elif state['step'] == 'booking_equipment_need':
-                if text_lower == 'да':
-                    send_message(user_id, '🖥️ Перечислите необходимое оборудование (например: проектор, доска):')
-                    state['booking']['equipment'] = []
-                    state['step'] = 'booking_equipment_list'
-                elif text_lower == 'нет':
-                    state['booking']['equipment'] = []
-                    filtered_keyboard, _ = get_filtered_rooms_keyboard(
-                        int(state.get('booking', {}).get('people', 1) or 1)
-                    )
-                    
-                    send_message(user_id, '🚪 Выберите переговорку:', keyboard=filtered_keyboard)
-                    state['step'] = 'choose_room'
-                else:
+                elif prev_step == 'booking_name':
+                    send_message(user_id, '🏢 Введите название мероприятия:')
+                elif prev_step == 'booking_format':
                     send_message(
                         user_id,
-                        '❌ Ответьте "Да" или "Нет":',
-                        keyboard=get_yes_no_keyboard()
+                        '🎯 Выберите формат мероприятия:',
+                        keyboard=get_booking_format_keyboard()
                     )
-
-            elif state['step'] == 'booking_equipment_list':
-                state['booking']['equipment'] = text
-                filtered_keyboard, _ = get_filtered_rooms_keyboard(
-                    int(state.get('booking', {}).get('people', 1) or 1)
-                )
-                
-                send_message(user_id, '🚪 Выберите переговорку:', keyboard=filtered_keyboard)
-                state['step'] = 'choose_room'
-
-            elif state['step'] == 'choose_room':
-                people_n = int(state.get('booking', {}).get('people', 1) or 1)
-                offered = offered_meeting_rooms(people_n)
-                if text in offered:
-                    state['booking']['room'] = text
-                    booking = state['booking']
-                    dialog_id = state.get('dialog_id')
-                    
-                    # Сохраняем бронь в БД
-                    try:
-                        equipment_str = format_booking_equipment(booking.get('equipment'))
-                        time_range = format_booking_time_range(
-                            booking['datetime_start'], booking['datetime_end']
-                        )
-
-                        # Получаем ID переговорки из маппинга
-                        room_id = room_name_to_id.get(text)
-
-                        # Обновляем состояние диалога
-                        if dialog_id:
-                            db.update_dialog_state(
-                                dialog_id,
-                                'бронь_создана',
-                                f"Бронь: {booking['name']}, {time_range}",
-                            )
-
-                        заявка_id = db.add_room_booking(
-                            vk_id=user_id,
-                            название_мероприятия=booking['name'],
-                            дата_и_время=booking['datetime_start'].isoformat(),
-                            id_переговорки=room_id,
-                            формат=booking.get('format', ''),
-                            количество_человек=booking.get('people', 0),
-                            необходимость_оборудования=equipment_str,
-                            id_диалога=dialog_id
-                        )
-                        print(f"✅ Бронь переговорки сохранена в БД с ID: {заявка_id}, переговорка ID: {room_id}, диалог: {dialog_id}")
-                    except Exception as e:
-                        print(f"⚠️ Ошибка сохранения брони в БД: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                    send_message(user_id, build_room_booking_summary(booking), keyboard=get_main_keyboard())
-                    reset_state(user_id)
-                else:
-                    booking = state.get('booking', {})
-                    filtered_keyboard, _ = get_filtered_rooms_keyboard(
-                        int(booking.get('people', 1) or 1)
-                    )
-                    send_message(
-                        user_id,
-                        f'❌ Эта переговорка не подходит для {booking.get("people", 1)} человек по правилам вместимости.\n\nВыберите переговорку из списка подходящих:',
-                        keyboard=filtered_keyboard
-                    )
-
-            # БРОНИРОВАНИЕ PLAYSTATION
-            elif state['step'] == 'ps_menu':
-                if 'забронировать' in text_lower or '✅' in text:
+                elif prev_step == 'booking_capacity':
+                    send_message(user_id, '👥 Введите количество участников (число):')
+                elif prev_step == 'ps_date':
                     send_message(user_id, '🎮 Введите желаемую дату в формате ДД.ММ.ГГГГ:')
-                    state['step'] = 'ps_date'
-                elif 'занятость' in text_lower or '📅' in text:
-                    report = build_ps_week_report(datetime.date.today())
-                    send_message(user_id, report, keyboard=get_ps_menu_keyboard())
-                elif 'отменить' in text_lower or '❌' in text:
+                elif prev_step == 'ps_time':
+                    available_times = state.get('ps', {}).get('available_times', [])
                     send_message(
                         user_id,
-                        'Введите дату брони для отмены в формате ДД.ММ.ГГГГ:',
-                    )
-                    state['step'] = 'ps_cancel_date'
-                else:
-                    send_message(user_id, 'Выберите действие:', keyboard=get_ps_menu_keyboard())
-
-            elif state['step'] == 'ps_date':
-                try:
-                    date_obj = datetime.datetime.strptime(text, '%d.%m.%Y').date()
-                    today = datetime.date.today()
-                    days_diff = (date_obj - today).days
-                    if days_diff < 0:
-                        send_message(user_id, '❌ Дата не может быть в прошлом. Введите дату в формате ДД.ММ.ГГГГ:')
-                    elif days_diff >= PS_BOOKING_DAYS:
-                        send_message(user_id, '❌ Бронь доступна только на неделю вперед. Введите другую дату:')
-                    elif date_obj.weekday() >= 5:
-                        send_message(user_id, '❌ PlayStation доступен только по будням (пн–пт). Введите другую дату:')
-                    else:
-                        state['ps']['date'] = text
-                        state['ps']['date_iso'] = date_obj.isoformat()
-                        available_times = get_ps_available_times(date_obj)
-                        state['ps']['available_times'] = available_times
-                        if not available_times:
-                            send_message(
-                                user_id,
-                                f'❌ На {text} нет свободных слотов. Выберите другую дату:'
-                            )
-                        else:
-                            send_message(
-                                user_id,
-                                f'✅ Дата: {text}\n\n🕒 Выберите время начала (доступные слоты):',
-                                keyboard=get_ps_time_keyboard(available_times)
-                            )
-                            state['step'] = 'ps_time'
-                except ValueError:
-                    send_message(user_id, '❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ (например, 15.03.2026):')
-
-            elif state['step'] == 'ps_time':
-                available_times = state.get('ps', {}).get('available_times', [])
-                if text not in available_times:
-                    send_message(
-                        user_id,
-                        '❌ Выберите время из доступных слотов:',
+                        '🕒 Выберите время начала (доступные слоты):',
                         keyboard=get_ps_time_keyboard(available_times)
                     )
-                else:
-                    state['ps']['time'] = text
-                    start_time = datetime.datetime.strptime(text, '%H:%M')
-                    end_time = (start_time + datetime.timedelta(hours=PS_SLOT_HOURS)).time()
-                    state['ps']['hours'] = PS_SLOT_HOURS
-                    state['ps']['end_time'] = end_time.strftime('%H:%M')
-                    summary = (
-                        f'📋 Подтвердите заявку на PlayStation:\n\n'
-                        f'📅 Дата: {state["ps"]["date"]}\n'
-                        f'🕐 Время: {state["ps"]["time"]} – {state["ps"]["end_time"]}\n'
-                        f'⏱ Продолжительность: {PS_SLOT_HOURS} ч.\n\n'
-                        f'Всё верно?'
-                    )
-                    send_message(user_id, summary, keyboard=get_yes_no_keyboard())
-                    state['step'] = 'ps_confirm'
-
-            elif state['step'] == 'ps_confirm':
-                if text_lower == 'да':
-                    ps = state['ps']
-                    dialog_id = state.get('dialog_id')
-                    try:
-                        if not db.is_ps_slot_available(ps['date_iso'], ps['time'], ps['end_time']):
-                            available_times = get_ps_available_times(datetime.datetime.strptime(ps['date'], '%d.%m.%Y').date())
-                            state['ps']['available_times'] = available_times
-                            send_message(
-                                user_id,
-                                '❌ Этот слот уже занят. Выберите другое время:',
-                                keyboard=get_ps_time_keyboard(available_times)
-                            )
-                            state['step'] = 'ps_time'
-                            continue
-
-                        booking_id = db.add_ps_booking(
-                            vk_id=user_id,
-                            дата=ps['date_iso'],
-                            время_начала=ps['time'],
-                            время_окончания=ps['end_time'],
-                            количество_часов=ps['hours'],
-                            id_диалога=dialog_id
-                        )
-                        if not db.add_ps_slot(
-                            vk_id=user_id,
-                            дата=ps['date_iso'],
-                            время_начала=ps['time'],
-                            время_окончания=ps['end_time'],
-                            id_заявки=booking_id
-                        ):
-                            send_message(
-                                user_id,
-                                '❌ Этот слот уже занят. Выберите другое время:',
-                                keyboard=get_ps_time_keyboard(state['ps'].get('available_times', []))
-                            )
-                            state['step'] = 'ps_time'
-                            continue
-                        print(f'✅ Бронь PlayStation сохранена для пользователя {user_id}')
-                    except Exception as e:
-                        print(f'⚠️ Ошибка сохранения брони PS: {e}')
+                elif prev_step == 'ps_menu':
                     send_message(
                         user_id,
-                        f'✅ Заявка на PlayStation принята!\n\n'
-                        f'📅 Дата: {ps["date"]}\n'
-                        f'🕐 Время: {ps["time"]} – {ps["end_time"]}\n'
-                        f'⏱ Продолжительность: {ps["hours"]} ч.\n\n'
-                        f'Мы свяжемся с вами для подтверждения.',
-                        keyboard=get_main_keyboard()
+                        '🎮 Бронирование PlayStation\n\nБронь доступна только на неделю вперед и только на 1 час. Продление — на месте у администратора.\n\nВыберите действие:',
+                        keyboard=get_ps_menu_keyboard()
                     )
+                elif prev_step == 'ps_cancel_date':
+                    send_message(user_id, '❌ Введите дату брони для отмены (ДД.ММ.ГГГГ):')
+                # elif prev_step == 'media_confirm':
+                #     send_message(
+                #         user_id,
+                #         '🎬 Ознакомьтесь с критериями отбора медиапроектов.\n\nПодтвердите прочтение:',
+                #         keyboard=get_yes_no_keyboard()
+                #     )
+        return
+
+    # НАЧАЛЬНОЕ СОСТОЯНИЕ - показываем стартовую клавиатуру при первом входе
+    if state['step'] == 'start' and not any(keyword in text_lower for keyword in ['начать', 'start', 'привет', 'меню', '📝', '🏢', '🎮', 'playstation', 'плейстейш', 'плейстейшен', 'проект', 'башн', 'иной', 'вопрос', 'проектная']):
+        send_message(
+            user_id,
+            '👋 Добро пожаловать в бот Башни Политеха!\n\nНажмите "Начать" для работы с ботом:',
+            keyboard=get_start_keyboard()
+        )
+        return
+
+    # ГЛАВНОЕ МЕНЮ 
+    if state['step'] == 'start':
+        if text_lower in ['начать', '🚀', 'start', 'привет', 'меню'] or '🚀 начать' in text_lower:
+            send_message(
+                user_id,
+                '👋 Добро пожаловать! Выберите нужную услугу:',
+                keyboard=get_main_keyboard()
+            )
+        elif '📝' in text or 'служебн' in text_lower:
+            send_message(
+                user_id,
+                '📝 Выберите тип документа:',
+                keyboard=get_service_type_keyboard()
+            )
+            state['step'] = 'choose_service_type'
+            return
+        elif '📨' in text or ('письмо' in text_lower and 'поддержк' in text_lower):
+            send_message(
+                user_id,
+                instructions['письмо поддержки'],
+                keyboard=get_yes_no_keyboard()
+            )
+            state['service_type'] = 'письмо поддержки'
+            state['step'] = 'support_letter_confirm'
+        elif '🌍' in text or 'поездк' in text_lower:
+            send_message(
+                user_id,
+                instructions['поездка'] + '\n\nВсё понятно? Остались вопросы?',
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'trip_questions'
+            return
+        elif '🏢' in text or 'бронь' in text_lower or 'переговорк' in text_lower:
+            send_message(
+                user_id,
+                '🏢 Добро пожаловать в раздел бронирования аудиторий Башни Политех!\n\nЗдесь вы сможете подобрать помещение для своего мероприятия и узнать все правила. Выберите интересующий пункт меню:',
+                keyboard=get_booking_menu_keyboard()
+            )
+            state['step'] = 'booking_menu'
+            return
+        elif '🎮' in text or 'playstation' in text_lower or 'плейстейшн' in text_lower or 'плейстейшен' in text_lower or 'ps' == text_lower:
+            send_message(
+                user_id,
+                '🎮 Бронирование PlayStation\n\nБронь доступна только на неделю вперед и только на 1 час. Продление — на месте у администратора.\n\n⏰ Время работы: будни с 09:30 до 20:30\n\nВыберите действие:',
+                keyboard=get_ps_menu_keyboard()
+            )
+            state['step'] = 'ps_menu'
+            state['ps'] = {}
+            return
+        elif text == PROJECT_START_BUTTON or 'проектная среда' in text_lower:
+            send_message(
+                user_id,
+                PROJECT_START_INTRO,
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'project_start_confirm'
+            return
+        elif text == OTHER_QUESTION_BUTTON or 'иной вопрос' in text_lower:
+            send_message(
+                user_id,
+                '✍️ Напишите интересующий вас вопрос — администратор Башни увидит его в этом чате и ответит.\n\n'
+                'Чтобы снова пользоваться меню бота, напишите «начать».'
+            )
+            state['step'] = 'other_question_silent'
+            return
+        # elif '🎬' in text or 'медиа' in text_lower:
+        #     send_message(
+        #         user_id,
+        #         '🎬 Ознакомьтесь с критериями отбора медиапроектов.\n\nПодтвердите прочтение:',
+        #         keyboard=get_yes_no_keyboard()
+        #     )
+        #     state['step'] = 'confirm_criteria'
+        #     state['media'] = {}
+        #     continue
+        else:
+            send_message(
+                user_id,
+                '👋 Выберите услугу из меню:',
+                keyboard=get_main_keyboard()
+            )
+
+    # СЛУЖЕБНЫЕ ЗАПИСКИ
+    elif state['step'] == 'choose_service_type':
+        if text_lower == 'аудитория':
+            state['service_type'] = text_lower
+            send_message(
+                user_id,
+                '❓ Согласовано ли бронирование аудитории? (128 ауд. ГЗ, каб. В.1.15 НИК, ответственные за корпуса)',
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'auditorium_approved'
+        elif text_lower == 'освобождение':
+            state['service_type'] = text_lower
+            send_message(
+                user_id,
+                '❓ Есть ли официальная причина освобождения? (Мероприятие в Календарном плане, Письмо приглашение и т.д.)',
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'release_reason'
+        elif text_lower == 'пропуск':
+            state['service_type'] = text_lower
+            send_message(
+                user_id,
+                instructions[text_lower] + '\n\n✅ Ознакомились с инструкцией?',
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'confirm_instruction'
+        elif '📨' in text or ('письмо' in text_lower and 'поддержк' in text_lower):
+            send_message(
+                user_id,
+                instructions['письмо поддержки'],
+                keyboard=get_yes_no_keyboard()
+            )
+            state['service_type'] = 'письмо поддержки'
+            state['step'] = 'support_letter_confirm'
+        elif '🌍' in text or 'поездк' in text_lower:
+            send_message(
+                user_id,
+                instructions['поездка'] + '\n\nВсё понятно? Остались вопросы?',
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'trip_questions'
+        else:
+            send_message(
+                user_id,
+                '❌ Пожалуйста, выберите тип из списка:',
+                keyboard=get_service_type_keyboard()
+            )
+
+    # Обработка начальных вопросов для аудитории
+    elif state['step'] == 'auditorium_approved':
+        if text_lower == 'да':
+            send_message(
+                user_id,
+                instructions['аудитория'] + '\n\n✅ Ознакомились с инструкцией?',
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'confirm_instruction'
+        elif text_lower == 'нет':
+            send_message(
+                user_id,
+                '❌ Перед оформлением служебной записки необходимо забронировать аудиторию',
+                keyboard=get_main_keyboard()
+            )
+            reset_state(user_id)
+        else:
+            send_message(
+                user_id,
+                '❌ Ответьте "Да" или "Нет":',
+                keyboard=get_yes_no_keyboard()
+            )
+
+    # Обработка начальных вопросов для освобождения
+    elif state['step'] == 'release_reason':
+        if text_lower == 'да':
+            send_message(
+                user_id,
+                instructions['освобождение'] + '\n\n✅ Ознакомились с инструкцией?',
+                keyboard=get_yes_no_keyboard()
+            )
+            state['step'] = 'confirm_instruction'
+        elif text_lower == 'нет':
+            send_message(
+                user_id,
+                '❌ Перед оформлением служебной записки необходимо получить официальную причину освобождения',
+                keyboard=get_main_keyboard()
+            )
+            reset_state(user_id)
+        else:
+            send_message(
+                user_id,
+                '❌ Ответьте "Да" или "Нет":',
+                keyboard=get_yes_no_keyboard()
+            )
+
+    # Обработка письма поддержки
+    elif state['step'] == 'support_letter_confirm':
+        if text_lower == 'да':
+            # Отправляем шаблон письма поддержки после подтверждения
+            template_file = templates.get('письмо поддержки')
+            if template_file and os.path.exists(template_file):
+                send_document(user_id, template_file)
+
+            send_message(
+                user_id,
+                '✅ Шаблон отправлен! Пожалуйста, заполните его и направьте специалисту.',
+                keyboard=get_main_keyboard()
+            )
+            reset_state(user_id)
+        elif text_lower == 'нет':
+            send_message(
+                user_id,
+                '❌ Пожалуйста, ознакомьтесь с инструкцией и подтвердите:',
+                keyboard=get_yes_no_keyboard()
+            )
+        else:
+            send_message(
+                user_id,
+                '❌ Ответьте "Да" или "Нет":',
+                keyboard=get_yes_no_keyboard()
+            )
+
+    elif state['step'] == 'project_start_confirm':
+        if text_lower == 'да':
+            if os.path.exists(PROJECT_START_FILE):
+                if send_document(
+                    user_id,
+                    PROJECT_START_FILE,
+                    message='📎 Инструкция по участию в проектной среде.',
+                    keyboard=get_main_keyboard(),
+                ):
                     reset_state(user_id)
-                elif text_lower == 'нет':
+                else:
                     send_message(
                         user_id,
-                        '🎮 Введите желаемую дату снова в формате ДД.ММ.ГГГГ:'
+                        '❌ Не удалось отправить файл. Попробуйте нажать «Да» ещё раз.',
+                        keyboard=get_yes_no_keyboard(),
                     )
-                    state['ps'] = {}
-                    state['step'] = 'ps_date'
-                else:
-                    send_message(user_id, '❌ Ответьте "Да" или "Нет":', keyboard=get_yes_no_keyboard())
-
-            elif state['step'] == 'ps_cancel_date':
-                try:
-                    date_obj = datetime.datetime.strptime(text, '%d.%m.%Y').date()
-                    state['ps_cancel_date_iso'] = date_obj.isoformat()
-                    state['ps_cancel_date_display'] = text
-                    send_message(user_id, 'Введите время начала брони для отмены (ЧЧ:ММ):')
-                    state['step'] = 'ps_cancel_time'
-                except ValueError:
-                    send_message(user_id, '❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ:')
-
-            elif state['step'] == 'ps_cancel_time':
-                try:
-                    datetime.datetime.strptime(text, '%H:%M')
-                    date_iso = state.get('ps_cancel_date_iso')
-                    if not date_iso:
-                        send_message(user_id, '❌ Сначала укажите дату брони (ДД.ММ.ГГГГ):')
-                        state['step'] = 'ps_cancel_date'
-                        continue
-
-                    cancelled = db.cancel_ps_booking(user_id, date_iso, text)
-                    if not cancelled:
-                        date_display = state.get('ps_cancel_date_display')
-                        if date_display:
-                            cancelled = db.cancel_ps_booking(user_id, date_display, text)
-
-                    if cancelled:
-                        send_message(
-                            user_id,
-                            f'✅ Бронь на {datetime.datetime.strptime(date_iso, "%Y-%m-%d").strftime("%d.%m.%Y")} {text} отменена.',
-                            keyboard=get_ps_menu_keyboard()
-                        )
-                    else:
-                        owner_vk = None
-                        for d_try in (date_iso, state.get('ps_cancel_date_display')):
-                            if not d_try:
-                                continue
-                            owner_vk = db.get_ps_active_owner_for_slot(d_try, text)
-                            if owner_vk is not None:
-                                break
-                        if owner_vk is not None and owner_vk != user_id:
-                            send_message(
-                                user_id,
-                                '❌ Нельзя отменить не вашу бронь.',
-                                keyboard=get_ps_menu_keyboard(),
-                            )
-                        else:
-                            send_message(
-                                user_id,
-                                '❌ Активная бронь с такой датой и временем не найдена. Проверьте дату и время начала.',
-                                keyboard=get_ps_menu_keyboard(),
-                            )
-                    state['step'] = 'ps_menu'
-                except ValueError:
-                    send_message(user_id, '❌ Неверный формат времени. Используйте ЧЧ:ММ (например, 14:30):')
-
-            # МЕДИАПРОЕКТЫ (отключено)
-            # elif state['step'] == 'confirm_criteria':
-            #     if text_lower == 'да':
-            #         if os.path.exists(criteria_file):
-            #             send_document(user_id, criteria_file)
-            #
-            #         template_file = os.path.join(os.path.dirname(__file__), 'template_release.docx')
-            #         if os.path.exists(template_file):
-            #             send_document(user_id, template_file)
-            #
-            #         send_message(user_id, '🎬 Введите название проекта:')
-            #         state['step'] = 'media_name'
-            #     elif text_lower == 'нет':
-            #         send_message(
-            #             user_id,
-            #             '❌ Пожалуйста, ознакомьтесь с критериями и подтвердите:',
-            #             keyboard=get_yes_no_keyboard()
-            #         )
-            #     else:
-            #         send_message(
-            #             user_id,
-            #             '❌ Ответьте "Да" или "Нет":',
-            #             keyboard=get_yes_no_keyboard()
-            #         )
-            #
-            # elif state['step'] == 'media_name':
-            #     state['media']['name'] = text
-            #     send_message(user_id, '📋 Укажите формат проекта:', keyboard=get_media_format_keyboard())
-            #     state['step'] = 'media_format'
-            #
-            # elif state['step'] == 'media_format':
-            #     state['media']['format'] = text
-            #     send_message(user_id, '🤝 Укажите необходимую поддержку:', keyboard=get_media_support_keyboard())
-            #     state['step'] = 'media_support'
-            #
-            # elif state['step'] == 'media_support':
-            #     state['media']['support'] = text
-            #     send_message(user_id, '📢 Укажите желаемое место публикации:', keyboard=get_media_publication_keyboard())
-            #     state['step'] = 'media_publication'
-            #
-            # elif state['step'] == 'media_publication':
-            #     if text_lower == 'свой вариант':
-            #         send_message(user_id, '📝 Введите своё место публикации:')
-            #         state['step'] = 'media_publication_custom'
-            #     else:
-            #         state['media']['publication'] = text
-            #         send_message(user_id, '📝 Опишите суть проекта (кратко, основная идея):')
-            #         state['step'] = 'media_description'
-            #
-            # elif state['step'] == 'media_publication_custom':
-            #     state['media']['publication'] = text
-            #     send_message(user_id, '📝 Опишите суть проекта (кратко, основная идея):')
-            #     state['step'] = 'media_description'
-            #
-            # elif state['step'] == 'media_description':
-            #     state['media']['description'] = text
-            #     media = state['media']
-            #     dialog_id = state.get('dialog_id')
-            #     try:
-            #         if dialog_id:
-            #             db.update_dialog_state(dialog_id, 'медиапроект_создан', f"Медиапроект: {media['name']}")
-            #         заявка_id = db.add_media_project(
-            #             vk_id=user_id,
-            #             название=media['name'],
-            #             формат=media['format'],
-            #             описание=media['description'],
-            #             необходимая_поддержка=media.get('support', ''),
-            #             место_публикации=media.get('publication', ''),
-            #             id_диалога=dialog_id
-            #         )
-            #         print(f"✅ Медиапроект сохранен в БД с ID: {заявка_id}, диалог: {dialog_id}")
-            #     except Exception as e:
-            #         print(f"⚠️ Ошибка сохранения медиапроекта в БД: {e}")
-            #         import traceback
-            #         traceback.print_exc()
-            #     summary = f'''✅ Заявка на медиапроект зарегистрирована!
-            #
-            # 🎬 Детали проекта:
-            # • Название: {media['name']}
-            # • Формат: {media['format']}
-            # • Поддержка: {media['support']}
-            # • Публикация: {media['publication']}
-            # • Описание: {media['description']}
-            #
-            # 📋 Следующие шаги:
-            # 1. Ваш проект будет рассмотрен в течение 5 рабочих дней
-            # 2. Вы получите уведомление о решении
-            # 3. При одобрении с вами свяжется куратор проекта
-            #
-            # Спасибо! Ваша заявка принята в работу.'''
-            #     send_message(user_id, summary, keyboard=get_main_keyboard())
-            #     reset_state(user_id)
-
-            # Пользователи, застрявшие в старых шагах медиапроекта — в главное меню
-            elif state['step'] in (
-                'confirm_criteria', 'media_name', 'media_format', 'media_support',
-                'media_publication', 'media_publication_custom', 'media_description',
-            ):
+            else:
                 send_message(
                     user_id,
-                    'Раздел «Медиапроект» временно недоступен. Выберите другую услугу:',
+                    '❌ Файл инструкции не найден. Обратитесь к администратору.',
                     keyboard=get_main_keyboard(),
                 )
                 reset_state(user_id)
+        elif text_lower == 'нет':
+            send_message(
+                user_id,
+                PROJECT_START_INTRO,
+                keyboard=get_yes_no_keyboard(),
+            )
+        else:
+            send_message(
+                user_id,
+                '❌ Ответьте «Да», чтобы получить инструкцию, или «Нет»:',
+                keyboard=get_yes_no_keyboard(),
+            )
 
-            # ============== ОБРАБОТКА НЕИЗВЕСТНЫХ КОМАНД ==============
+    # Обработка поездки
+    elif state['step'] == 'trip_questions':
+        if text_lower == 'нет':
+            send_message(
+                user_id,
+                '✅ Отлично! Оформляйте заявки через КИС.',
+                keyboard=get_main_keyboard()
+            )
+            reset_state(user_id)
+        elif text_lower == 'да':
+            send_message(
+                user_id,
+                'ℹ️ Обратитесь с вопросами к специалисту: https://vk.com/nataleeeeeeeeshka',
+                keyboard=get_main_keyboard()
+            )
+            reset_state(user_id)
+        else:
+            send_message(
+                user_id,
+                '❌ Ответьте "Да" или "Нет":',
+                keyboard=get_yes_no_keyboard()
+            )
+
+    elif state['step'] == 'confirm_instruction':
+        if text_lower == 'да':
+            state['service_data'] = {}  # Инициализация словаря для данных служебки
+            # Шаблоны и вложения для пропуска отправляются только после принятой даты (см. enter_date)
+            send_message(user_id, '📅 Введите дату служебки в формате ДД.ММ.ГГГГ:')
+            state['step'] = 'enter_date'
+        elif text_lower == 'нет':
+            send_message(
+                user_id,
+                '❌ Пожалуйста, ознакомьтесь с инструкцией и подтвердите:',
+                keyboard=get_yes_no_keyboard()
+            )
+        else:
+            send_message(
+                user_id,
+                '❌ Ответьте "Да" или "Нет":',
+                keyboard=get_yes_no_keyboard()
+            )
+
+    elif state['step'] == 'enter_date':
+        try:
+            date_raw = text.replace(',', '.').replace('/', '.').strip()
+            date = datetime.datetime.strptime(date_raw, '%d.%m.%Y').date()
+            today = datetime.date.today()
+            days_diff = (date - today).days
+            date_display = date.strftime('%d.%m.%Y')
+
+            # Валидация: минимум 3 дня, максимум 2 месяца (60 дней)
+            if days_diff < 3:
+                send_message(
+                    user_id,
+                    f'❌ Заявка отклонена!\n\nДата должна быть минимум за 3 дня от сегодняшней.\nУказанная дата: {date_display}\nДо даты осталось дней: {days_diff}',
+                    keyboard=get_main_keyboard()
+                )
+                reset_state(user_id)
+            elif days_diff > 60:
+                max_date = today + datetime.timedelta(days=60)
+                send_message(
+                    user_id,
+                    f'❌ Заявка отклонена!\n\nСлужебную записку можно сформировать только на ближайшие 2 месяца.\nМаксимальная доступная дата: {max_date.strftime("%d.%m.%Y")}',
+                    keyboard=get_main_keyboard()
+                )
+                reset_state(user_id)
             else:
-                # Проверяем, не является ли это просто отправкой документа
-                if 'attachments' in message and message['attachments']:
-                    attachment = message['attachments'][0]
-                    if attachment['type'] == 'doc':
-                        # Сохраняем документ как "общий"
-                        doc_id = process_document(
-                            user_id=user_id,
-                            attachment=attachment,
-                            тип_документа='общий',
-                            id_заявки=None
+                # Сохраняем дату в состоянии
+                if 'service_data' not in state:
+                    state['service_data'] = {}
+                state['service_data']['date'] = date_display
+
+                service_type = state.get('service_type')
+                if service_type == 'пропуск':
+                    consent_file = os.path.join(SCRIPT_DIR, 'templates', 'СОГЛАСИЕ НА ОБРАБОТКУ (2).DOC')
+                    if os.path.exists(consent_file):
+                        send_document(user_id, consent_file)
+                    participants_file = os.path.join(SCRIPT_DIR, 'templates', 'Шаблон_Участники (2).xlsx')
+                    if os.path.exists(participants_file):
+                        send_document(user_id, participants_file)
+
+                template_file = templates.get(service_type)
+
+                if template_file and os.path.exists(template_file):
+                    if send_document(user_id, template_file):
+                        send_message(
+                            user_id,
+                            f'✅ Дата принята: {date_display}\n\n📎 Заполните шаблон и отправьте файл в ответ.'
                         )
-                        
-                        if doc_id:
-                            doc = attachment['doc']
-                            file_name = doc.get('title', 'документ')
-                            send_message(
-                                user_id,
-                                f'✅ Документ "{file_name}" получен и сохранен!\n\nДокумент будет рассмотрен администратором.',
-                                keyboard=get_main_keyboard()
-                            )
-                        else:
-                            send_message(
-                                user_id,
-                                '❌ Ошибка при сохранении документа.',
-                                keyboard=get_main_keyboard()
-                            )
+                        state['step'] = 'wait_file'
                     else:
                         send_message(
                             user_id,
-                            '❌ Неизвестная команда. Вернитесь в главное меню:',
-                            keyboard=get_main_keyboard()
+                            '❌ Дата принята, но файл шаблона не удалось отправить (ошибка ВКонтакте при загрузке). '
+                            'Попробуйте отправить ту же дату ещё раз через минуту. Если не поможет — напишите администратору.',
+                            keyboard=get_main_keyboard(),
                         )
+                else:
+                    send_message(user_id, '❌ Шаблон не найден. Обратитесь к администратору.')
+                    reset_state(user_id)
+        except ValueError:
+            send_message(user_id, '❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ (например, 20.12.2025)')
+
+    elif state['step'] == 'wait_file':
+        if 'attachments' in message and message['attachments']:
+            # Валидация формата файла
+            attachment = message['attachments'][0]
+            if attachment['type'] == 'doc':
+                doc = attachment['doc']
+                file_ext = doc.get('ext', '').lower()
+                allowed_formats = ['txt', 'docx', 'doc', 'pdf']
+
+                if file_ext not in allowed_formats:
+                    send_message(
+                        user_id,
+                        f'❌ Недопустимый формат файла: .{file_ext}\n\nРазрешенные форматы: {", ".join(allowed_formats)}\n\nПожалуйста, отправьте файл в правильном формате.'
+                    )
+                    return
+
+            # Помечаем беседу как важную для проверяющих
+            try:
+                vk.messages.markAsImportantConversation(
+                    peer_id=user_id,
+                    important=1
+                )
+                print(f"📌 Диалог с пользователем {user_id} помечен как важный")
+            except Exception as e:
+                print(f"⚠️ Не удалось пометить диалог как важный: {e}")
+                import traceback
+                traceback.print_exc()
+
+            # Сохраняем заявку в БД
+            заявка_id = None
+            try:
+                service_type = state.get('service_type')
+                service_data = state.get('service_data', {})
+                service_id = service_type_ids.get(service_type, 1)
+                date_str = service_data.get('date', '')
+                dialog_id = state.get('dialog_id')
+
+                # Преобразуем дату в ISO формат
+                if date_str:
+                    date_obj = datetime.datetime.strptime(date_str, '%d.%m.%Y')
+                    date_iso = date_obj.isoformat()
+                else:
+                    date_iso = datetime.datetime.now().isoformat()
+
+                # Обновляем состояние диалога
+                if dialog_id:
+                    db.update_dialog_state(dialog_id, 'служебка_обработана', f"Служебка: {service_type}")
+
+                # Сохраняем в БД
+                заявка_id = db.add_service_note(
+                    vk_id=user_id,
+                    id_служебки=service_id,
+                    дата_мероприятия=date_iso,
+                    id_диалога=dialog_id,
+                    комментарии=f"Тип: {service_type}"
+                )
+                print(f"✅ Служебка сохранена в БД с ID: {заявка_id}, диалог: {dialog_id}")
+
+                # Сохраняем документ в БД и связываем с заявкой
+                doc_id = process_document(
+                    user_id=user_id,
+                    attachment=attachment,
+                    тип_документа='служебка',
+                    id_заявки=заявка_id
+                )
+
+                if doc_id:
+                    print(f"✅ Документ #{doc_id} связан с заявкой #{заявка_id}")
+
+            except Exception as e:
+                print(f"⚠️ Ошибка сохранения служебки в БД: {e}")
+                import traceback
+                traceback.print_exc()
+
+            send_message(
+                user_id,
+                '✅ Служебная записка принята и взята в работу!\n\nВаш запрос обрабатывается. Результат будет отправлен в течение 2-3 рабочих дней.\n\nСпасибо за обращение!',
+                keyboard=get_main_keyboard()
+            )
+            reset_state(user_id)
+        else:
+            send_message(user_id, '❌ Пожалуйста, отправьте заполненный файл.')
+
+    # БРОНЬ ПЕРЕГОВОРОК - МЕНЮ
+    elif state['step'] == 'booking_menu':
+        if 'правила' in text_lower or '📋' in text:
+            send_message(
+                user_id,
+                '📋 Правила и время работы\n\n'
+                'Кто может бронировать?\n'
+                'Бронировать наши помещения могут Институты и подразделения СПбПУ, студенты и студенческие объединения, а также партнёры нашего Университета, которые имеют заверенный статус и ответственное лицо из числа работников. В других случаях — по согласованию с администрацией.\n\n'
+                '⏰ Часы работы:\n'
+                'По будням с 09:30 до 20:30. Завершение программы — не позднее 20:20.\n\n'
+                '📝 Правила регистрации:\n'
+                '• Бронирование — не позднее чем за 30 календарных дней до события\n'
+                f'• Дата и время мероприятия в боте — не позднее чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с момента заявки\n'
+                '• Обязательна регистрация в Leader-ID минимум за 24 часа до начала. Без активной страницы события бронь аннулируется\n'
+                '• Каждый участник должен иметь профиль в Leader-ID; у стойки — скан персонального QR-кода\n'
+                '• Мультимедийное оборудование — по запросу через администратора или технического специалиста\n\n'
+                'Спасибо, что планируете мероприятия с нами. Ждём вас в Башне!',
+                keyboard=get_booking_menu_keyboard()
+            )
+        elif 'забронировать' in text_lower or '📅' in text:
+            send_message(user_id, '🏢 Введите название мероприятия:')
+            state['step'] = 'booking_name'
+            state['booking'] = {}
+        else:
+            send_message(
+                user_id,
+                '🏢 Выберите интересующий пункт:',
+                keyboard=get_booking_menu_keyboard()
+            )
+
+    elif state['step'] == 'booking_name':
+        # Валидация: название не может состоять только из цифр
+        if text.isdigit():
+            send_message(user_id, '❌ Название мероприятия не может состоять только из цифр. Пожалуйста, введите корректное название:')
+        else:
+            state['booking']['name'] = text
+            send_message(user_id, '📋 Укажите формат мероприятия:', keyboard=get_booking_format_keyboard())
+            state['step'] = 'booking_format'
+
+    elif state['step'] == 'booking_format':
+        if text_lower == 'свой вариант':
+            send_message(user_id, '📝 Введите свой формат мероприятия:')
+            state['step'] = 'booking_format_custom'
+        else:
+            state['booking']['format'] = text
+            send_message(user_id, '👥 Укажите количество участников:')
+            state['step'] = 'booking_people'
+
+    elif state['step'] == 'booking_format_custom':
+        state['booking']['format'] = text
+        send_message(user_id, '👥 Укажите количество участников:')
+        state['step'] = 'booking_people'
+
+    elif state['step'] == 'booking_people':
+        try:
+            people_count = parse_participants_count(text)
+            if people_count < 1:
+                send_message(user_id, '❌ Укажите число участников не меньше 1.')
+                return
+            state['booking']['people'] = people_count
+
+            filtered_keyboard, suitable_rooms = get_filtered_rooms_keyboard(people_count)
+
+            if suitable_rooms:
+                send_message(
+                    user_id,
+                    f'🏢 Для {people_count} чел. показаны переговорки, которые по правилам можно забронировать при таком числе участников:'
+                )
+                send_meeting_room_previews(user_id, suitable_rooms)
+
+                send_message(
+                    user_id,
+                    '🕒 Введите дату и время начала и окончания мероприятия в формате '
+                    'ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30).\n'
+                    f'Дата не может быть позже чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с текущего момента.'
+                )
+                state['step'] = 'booking_datetime'
+                state['suitable_rooms'] = suitable_rooms  # Сохраняем список подходящих переговорок
+            else:
+                send_message(
+                    user_id,
+                    '❌ Нет переговорки под это число участников (в боте доступны залы до 100 человек по правилам каждого зала).\n\n👥 Укажите другое число участников:'
+                )
+        except ValueError:
+            send_message(user_id, '❌ Введите корректное число участников.')
+
+    elif state['step'] == 'booking_datetime':
+        try:
+            booking_start, booking_end = parse_booking_datetime_range(text)
+            today = datetime.datetime.now()
+            max_date = today + datetime.timedelta(days=BOOKING_ROOM_MAX_AHEAD_DAYS)
+
+            if booking_start < today:
+                send_message(
+                    user_id,
+                    '❌ Дата не может быть в прошлом. Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ:'
+                )
+            elif booking_end > max_date:
+                send_message(
+                    user_id,
+                    f'❌ Бронь переговорки возможна не дальше чем на {BOOKING_ROOM_MAX_AHEAD_DAYS} суток от момента заявки (около 1 месяца).\n'
+                    f'Самая поздняя допустимая дата и время окончания: {max_date.strftime("%d.%m.%Y %H:%M")}\n\n'
+                    'Введите другой диапазон (ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ):'
+                )
+            else:
+                state['booking']['datetime_start'] = booking_start
+                state['booking']['datetime_end'] = booking_end
+                send_message(
+                    user_id,
+                    '🖥️ Необходимо оборудование?',
+                    keyboard=get_yes_no_keyboard()
+                )
+                state['step'] = 'booking_equipment_need'
+        except ValueError as e:
+            if str(e) == 'end before start':
+                send_message(
+                    user_id,
+                    '❌ Время окончания должно быть позже времени начала. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30):'
+                )
+            else:
+                send_message(
+                    user_id,
+                    '❌ Неверный формат. Используйте ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30):'
+                )
+
+    elif state['step'] == 'booking_equipment_need':
+        if text_lower == 'да':
+            send_message(user_id, '🖥️ Перечислите необходимое оборудование (например: проектор, доска):')
+            state['booking']['equipment'] = []
+            state['step'] = 'booking_equipment_list'
+        elif text_lower == 'нет':
+            state['booking']['equipment'] = []
+            filtered_keyboard, _ = get_filtered_rooms_keyboard(
+                int(state.get('booking', {}).get('people', 1) or 1)
+            )
+
+            send_message(user_id, '🚪 Выберите переговорку:', keyboard=filtered_keyboard)
+            state['step'] = 'choose_room'
+        else:
+            send_message(
+                user_id,
+                '❌ Ответьте "Да" или "Нет":',
+                keyboard=get_yes_no_keyboard()
+            )
+
+    elif state['step'] == 'booking_equipment_list':
+        state['booking']['equipment'] = text
+        filtered_keyboard, _ = get_filtered_rooms_keyboard(
+            int(state.get('booking', {}).get('people', 1) or 1)
+        )
+
+        send_message(user_id, '🚪 Выберите переговорку:', keyboard=filtered_keyboard)
+        state['step'] = 'choose_room'
+
+    elif state['step'] == 'choose_room':
+        people_n = int(state.get('booking', {}).get('people', 1) or 1)
+        offered = offered_meeting_rooms(people_n)
+        if text in offered:
+            state['booking']['room'] = text
+            booking = state['booking']
+            dialog_id = state.get('dialog_id')
+
+            # Сохраняем бронь в БД
+            try:
+                equipment_str = format_booking_equipment(booking.get('equipment'))
+                time_range = format_booking_time_range(
+                    booking['datetime_start'], booking['datetime_end']
+                )
+
+                # Получаем ID переговорки из маппинга
+                room_id = room_name_to_id.get(text)
+
+                # Обновляем состояние диалога
+                if dialog_id:
+                    db.update_dialog_state(
+                        dialog_id,
+                        'бронь_создана',
+                        f"Бронь: {booking['name']}, {time_range}",
+                    )
+
+                заявка_id = db.add_room_booking(
+                    vk_id=user_id,
+                    название_мероприятия=booking['name'],
+                    дата_и_время=booking['datetime_start'].isoformat(),
+                    id_переговорки=room_id,
+                    формат=booking.get('format', ''),
+                    количество_человек=booking.get('people', 0),
+                    необходимость_оборудования=equipment_str,
+                    id_диалога=dialog_id
+                )
+                print(f"✅ Бронь переговорки сохранена в БД с ID: {заявка_id}, переговорка ID: {room_id}, диалог: {dialog_id}")
+            except Exception as e:
+                print(f"⚠️ Ошибка сохранения брони в БД: {e}")
+                import traceback
+                traceback.print_exc()
+
+            send_message(user_id, build_room_booking_summary(booking), keyboard=get_main_keyboard())
+            reset_state(user_id)
+        else:
+            booking = state.get('booking', {})
+            filtered_keyboard, _ = get_filtered_rooms_keyboard(
+                int(booking.get('people', 1) or 1)
+            )
+            send_message(
+                user_id,
+                f'❌ Эта переговорка не подходит для {booking.get("people", 1)} человек по правилам вместимости.\n\nВыберите переговорку из списка подходящих:',
+                keyboard=filtered_keyboard
+            )
+
+    # БРОНИРОВАНИЕ PLAYSTATION
+    elif state['step'] == 'ps_menu':
+        if 'забронировать' in text_lower or '✅' in text:
+            send_message(user_id, '🎮 Введите желаемую дату в формате ДД.ММ.ГГГГ:')
+            state['step'] = 'ps_date'
+        elif 'занятость' in text_lower or '📅' in text:
+            report = build_ps_week_report(datetime.date.today())
+            send_message(user_id, report, keyboard=get_ps_menu_keyboard())
+        elif 'отменить' in text_lower or '❌' in text:
+            send_message(
+                user_id,
+                'Введите дату брони для отмены в формате ДД.ММ.ГГГГ:',
+            )
+            state['step'] = 'ps_cancel_date'
+        else:
+            send_message(user_id, 'Выберите действие:', keyboard=get_ps_menu_keyboard())
+
+    elif state['step'] == 'ps_date':
+        try:
+            date_obj = datetime.datetime.strptime(text, '%d.%m.%Y').date()
+            today = datetime.date.today()
+            days_diff = (date_obj - today).days
+            if days_diff < 0:
+                send_message(user_id, '❌ Дата не может быть в прошлом. Введите дату в формате ДД.ММ.ГГГГ:')
+            elif days_diff >= PS_BOOKING_DAYS:
+                send_message(user_id, '❌ Бронь доступна только на неделю вперед. Введите другую дату:')
+            elif date_obj.weekday() >= 5:
+                send_message(user_id, '❌ PlayStation доступен только по будням (пн–пт). Введите другую дату:')
+            else:
+                state['ps']['date'] = text
+                state['ps']['date_iso'] = date_obj.isoformat()
+                available_times = get_ps_available_times(date_obj)
+                state['ps']['available_times'] = available_times
+                if not available_times:
+                    send_message(
+                        user_id,
+                        f'❌ На {text} нет свободных слотов. Выберите другую дату:'
+                    )
                 else:
                     send_message(
                         user_id,
-                        '❌ Неизвестная команда. Вернитесь в главное меню:',
+                        f'✅ Дата: {text}\n\n🕒 Выберите время начала (доступные слоты):',
+                        keyboard=get_ps_time_keyboard(available_times)
+                    )
+                    state['step'] = 'ps_time'
+        except ValueError:
+            send_message(user_id, '❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ (например, 15.03.2026):')
+
+    elif state['step'] == 'ps_time':
+        available_times = state.get('ps', {}).get('available_times', [])
+        if text not in available_times:
+            send_message(
+                user_id,
+                '❌ Выберите время из доступных слотов:',
+                keyboard=get_ps_time_keyboard(available_times)
+            )
+        else:
+            state['ps']['time'] = text
+            start_time = datetime.datetime.strptime(text, '%H:%M')
+            end_time = (start_time + datetime.timedelta(hours=PS_SLOT_HOURS)).time()
+            state['ps']['hours'] = PS_SLOT_HOURS
+            state['ps']['end_time'] = end_time.strftime('%H:%M')
+            summary = (
+                f'📋 Подтвердите заявку на PlayStation:\n\n'
+                f'📅 Дата: {state["ps"]["date"]}\n'
+                f'🕐 Время: {state["ps"]["time"]} – {state["ps"]["end_time"]}\n'
+                f'⏱ Продолжительность: {PS_SLOT_HOURS} ч.\n\n'
+                f'Всё верно?'
+            )
+            send_message(user_id, summary, keyboard=get_yes_no_keyboard())
+            state['step'] = 'ps_confirm'
+
+    elif state['step'] == 'ps_confirm':
+        if text_lower == 'да':
+            ps = state['ps']
+            dialog_id = state.get('dialog_id')
+            try:
+                if not db.is_ps_slot_available(ps['date_iso'], ps['time'], ps['end_time']):
+                    available_times = get_ps_available_times(datetime.datetime.strptime(ps['date'], '%d.%m.%Y').date())
+                    state['ps']['available_times'] = available_times
+                    send_message(
+                        user_id,
+                        '❌ Этот слот уже занят. Выберите другое время:',
+                        keyboard=get_ps_time_keyboard(available_times)
+                    )
+                    state['step'] = 'ps_time'
+                    return
+
+                booking_id = db.add_ps_booking(
+                    vk_id=user_id,
+                    дата=ps['date_iso'],
+                    время_начала=ps['time'],
+                    время_окончания=ps['end_time'],
+                    количество_часов=ps['hours'],
+                    id_диалога=dialog_id
+                )
+                if not db.add_ps_slot(
+                    vk_id=user_id,
+                    дата=ps['date_iso'],
+                    время_начала=ps['time'],
+                    время_окончания=ps['end_time'],
+                    id_заявки=booking_id
+                ):
+                    send_message(
+                        user_id,
+                        '❌ Этот слот уже занят. Выберите другое время:',
+                        keyboard=get_ps_time_keyboard(state['ps'].get('available_times', []))
+                    )
+                    state['step'] = 'ps_time'
+                    return
+                print(f'✅ Бронь PlayStation сохранена для пользователя {user_id}')
+            except Exception as e:
+                print(f'⚠️ Ошибка сохранения брони PS: {e}')
+            send_message(
+                user_id,
+                f'✅ Заявка на PlayStation принята!\n\n'
+                f'📅 Дата: {ps["date"]}\n'
+                f'🕐 Время: {ps["time"]} – {ps["end_time"]}\n'
+                f'⏱ Продолжительность: {ps["hours"]} ч.\n\n'
+                f'Мы свяжемся с вами для подтверждения.',
+                keyboard=get_main_keyboard()
+            )
+            reset_state(user_id)
+        elif text_lower == 'нет':
+            send_message(
+                user_id,
+                '🎮 Введите желаемую дату снова в формате ДД.ММ.ГГГГ:'
+            )
+            state['ps'] = {}
+            state['step'] = 'ps_date'
+        else:
+            send_message(user_id, '❌ Ответьте "Да" или "Нет":', keyboard=get_yes_no_keyboard())
+
+    elif state['step'] == 'ps_cancel_date':
+        try:
+            date_obj = datetime.datetime.strptime(text, '%d.%m.%Y').date()
+            state['ps_cancel_date_iso'] = date_obj.isoformat()
+            state['ps_cancel_date_display'] = text
+            send_message(user_id, 'Введите время начала брони для отмены (ЧЧ:ММ):')
+            state['step'] = 'ps_cancel_time'
+        except ValueError:
+            send_message(user_id, '❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ:')
+
+    elif state['step'] == 'ps_cancel_time':
+        try:
+            datetime.datetime.strptime(text, '%H:%M')
+            date_iso = state.get('ps_cancel_date_iso')
+            if not date_iso:
+                send_message(user_id, '❌ Сначала укажите дату брони (ДД.ММ.ГГГГ):')
+                state['step'] = 'ps_cancel_date'
+                return
+
+            cancelled = db.cancel_ps_booking(user_id, date_iso, text)
+            if not cancelled:
+                date_display = state.get('ps_cancel_date_display')
+                if date_display:
+                    cancelled = db.cancel_ps_booking(user_id, date_display, text)
+
+            if cancelled:
+                send_message(
+                    user_id,
+                    f'✅ Бронь на {datetime.datetime.strptime(date_iso, "%Y-%m-%d").strftime("%d.%m.%Y")} {text} отменена.',
+                    keyboard=get_ps_menu_keyboard()
+                )
+            else:
+                owner_vk = None
+                for d_try in (date_iso, state.get('ps_cancel_date_display')):
+                    if not d_try:
+                        return
+                    owner_vk = db.get_ps_active_owner_for_slot(d_try, text)
+                    if owner_vk is not None:
+                        break
+                if owner_vk is not None and owner_vk != user_id:
+                    send_message(
+                        user_id,
+                        '❌ Нельзя отменить не вашу бронь.',
+                        keyboard=get_ps_menu_keyboard(),
+                    )
+                else:
+                    send_message(
+                        user_id,
+                        '❌ Активная бронь с такой датой и временем не найдена. Проверьте дату и время начала.',
+                        keyboard=get_ps_menu_keyboard(),
+                    )
+            state['step'] = 'ps_menu'
+        except ValueError:
+            send_message(user_id, '❌ Неверный формат времени. Используйте ЧЧ:ММ (например, 14:30):')
+
+    # МЕДИАПРОЕКТЫ (отключено)
+    # elif state['step'] == 'confirm_criteria':
+    #     if text_lower == 'да':
+    #         if os.path.exists(criteria_file):
+    #             send_document(user_id, criteria_file)
+    #
+    #         template_file = os.path.join(os.path.dirname(__file__), 'template_release.docx')
+    #         if os.path.exists(template_file):
+    #             send_document(user_id, template_file)
+    #
+    #         send_message(user_id, '🎬 Введите название проекта:')
+    #         state['step'] = 'media_name'
+    #     elif text_lower == 'нет':
+    #         send_message(
+    #             user_id,
+    #             '❌ Пожалуйста, ознакомьтесь с критериями и подтвердите:',
+    #             keyboard=get_yes_no_keyboard()
+    #         )
+    #     else:
+    #         send_message(
+    #             user_id,
+    #             '❌ Ответьте "Да" или "Нет":',
+    #             keyboard=get_yes_no_keyboard()
+    #         )
+    #
+    # elif state['step'] == 'media_name':
+    #     state['media']['name'] = text
+    #     send_message(user_id, '📋 Укажите формат проекта:', keyboard=get_media_format_keyboard())
+    #     state['step'] = 'media_format'
+    #
+    # elif state['step'] == 'media_format':
+    #     state['media']['format'] = text
+    #     send_message(user_id, '🤝 Укажите необходимую поддержку:', keyboard=get_media_support_keyboard())
+    #     state['step'] = 'media_support'
+    #
+    # elif state['step'] == 'media_support':
+    #     state['media']['support'] = text
+    #     send_message(user_id, '📢 Укажите желаемое место публикации:', keyboard=get_media_publication_keyboard())
+    #     state['step'] = 'media_publication'
+    #
+    # elif state['step'] == 'media_publication':
+    #     if text_lower == 'свой вариант':
+    #         send_message(user_id, '📝 Введите своё место публикации:')
+    #         state['step'] = 'media_publication_custom'
+    #     else:
+    #         state['media']['publication'] = text
+    #         send_message(user_id, '📝 Опишите суть проекта (кратко, основная идея):')
+    #         state['step'] = 'media_description'
+    #
+    # elif state['step'] == 'media_publication_custom':
+    #     state['media']['publication'] = text
+    #     send_message(user_id, '📝 Опишите суть проекта (кратко, основная идея):')
+    #     state['step'] = 'media_description'
+    #
+    # elif state['step'] == 'media_description':
+    #     state['media']['description'] = text
+    #     media = state['media']
+    #     dialog_id = state.get('dialog_id')
+    #     try:
+    #         if dialog_id:
+    #             db.update_dialog_state(dialog_id, 'медиапроект_создан', f"Медиапроект: {media['name']}")
+    #         заявка_id = db.add_media_project(
+    #             vk_id=user_id,
+    #             название=media['name'],
+    #             формат=media['format'],
+    #             описание=media['description'],
+    #             необходимая_поддержка=media.get('support', ''),
+    #             место_публикации=media.get('publication', ''),
+    #             id_диалога=dialog_id
+    #         )
+    #         print(f"✅ Медиапроект сохранен в БД с ID: {заявка_id}, диалог: {dialog_id}")
+    #     except Exception as e:
+    #         print(f"⚠️ Ошибка сохранения медиапроекта в БД: {e}")
+    #         import traceback
+    #         traceback.print_exc()
+    #     summary = f'''✅ Заявка на медиапроект зарегистрирована!
+    #
+    # 🎬 Детали проекта:
+    # • Название: {media['name']}
+    # • Формат: {media['format']}
+    # • Поддержка: {media['support']}
+    # • Публикация: {media['publication']}
+    # • Описание: {media['description']}
+    #
+    # 📋 Следующие шаги:
+    # 1. Ваш проект будет рассмотрен в течение 5 рабочих дней
+    # 2. Вы получите уведомление о решении
+    # 3. При одобрении с вами свяжется куратор проекта
+    #
+    # Спасибо! Ваша заявка принята в работу.'''
+    #     send_message(user_id, summary, keyboard=get_main_keyboard())
+    #     reset_state(user_id)
+
+    # Пользователи, застрявшие в старых шагах медиапроекта — в главное меню
+    elif state['step'] in (
+        'confirm_criteria', 'media_name', 'media_format', 'media_support',
+        'media_publication', 'media_publication_custom', 'media_description',
+    ):
+        send_message(
+            user_id,
+            'Раздел «Медиапроект» временно недоступен. Выберите другую услугу:',
+            keyboard=get_main_keyboard(),
+        )
+        reset_state(user_id)
+
+    # ============== ОБРАБОТКА НЕИЗВЕСТНЫХ КОМАНД ==============
+    else:
+        # Проверяем, не является ли это просто отправкой документа
+        if 'attachments' in message and message['attachments']:
+            attachment = message['attachments'][0]
+            if attachment['type'] == 'doc':
+                # Сохраняем документ как "общий"
+                doc_id = process_document(
+                    user_id=user_id,
+                    attachment=attachment,
+                    тип_документа='общий',
+                    id_заявки=None
+                )
+
+                if doc_id:
+                    doc = attachment['doc']
+                    file_name = doc.get('title', 'документ')
+                    send_message(
+                        user_id,
+                        f'✅ Документ "{file_name}" получен и сохранен!\n\nДокумент будет рассмотрен администратором.',
                         keyboard=get_main_keyboard()
                     )
-                # Не сбрасываем состояние при получении документа
-                if state['step'] != 'start' and not ('attachments' in message and message['attachments']):
-                    reset_state(user_id)
+                else:
+                    send_message(
+                        user_id,
+                        '❌ Ошибка при сохранении документа.',
+                        keyboard=get_main_keyboard()
+                    )
+            else:
+                send_message(
+                    user_id,
+                    '❌ Неизвестная команда. Вернитесь в главное меню:',
+                    keyboard=get_main_keyboard()
+                )
+        else:
+            send_message(
+                user_id,
+                '❌ Неизвестная команда. Вернитесь в главное меню:',
+                keyboard=get_main_keyboard()
+            )
+        # Не сбрасываем состояние при получении документа
+        if state['step'] != 'start' and not ('attachments' in message and message['attachments']):
+            reset_state(user_id)
+
+
+def main():
+    global _stats_thread_started
+    print("🤖 Бот запущен и слушает события...", flush=True)
+
+    # Один поток статистики на весь процесс (при перезапуске main не плодим новые)
+    with _stats_thread_lock:
+        if not _stats_thread_started:
+            stats_thread = threading.Thread(
+                target=update_statistics_periodically,
+                daemon=True,
+                name='stats-updater',
+            )
+            stats_thread.start()
+            _stats_thread_started = True
+            print("📊 Поток обновления статистики запущен", flush=True)
+
+    for event in vk_events():
+        try:
+            if event.type != VkBotEventType.MESSAGE_NEW:
+                continue
+            if not getattr(event, 'from_user', False):
+                continue
+            handle_incoming_message(getattr(event, 'message', None))
+        except Exception as e:
+            print(f"❌ Ошибка обработки события: {e}", flush=True)
+            traceback.print_exc()
+            try:
+                msg = _message_as_dict(getattr(event, 'message', None))
+                uid = msg.get('from_id')
+                if uid:
+                    send_message(
+                        uid,
+                        '⚠️ Произошла техническая ошибка. Попробуйте ещё раз или вернитесь в главное меню.',
+                        keyboard=get_main_keyboard(),
+                    )
+                    reset_state(uid)
+            except Exception as notify_err:
+                print(f"⚠️ Не удалось уведомить пользователя об ошибке: {notify_err}", flush=True)
+
+
+def run_bot_forever():
+    """Перезапуск main() при критических сбоях (для работы на сервере без systemd)."""
+    restart_delay = 10
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            print('⏹ Остановка бота по запросу пользователя.', flush=True)
+            break
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f'💥 Критическая ошибка бота, перезапуск через {restart_delay} с: {e}', flush=True)
+            traceback.print_exc()
+        else:
+            print('⚠️ main() завершился неожиданно, перезапуск...', flush=True)
+        time.sleep(restart_delay)
+        restart_delay = min(restart_delay * 2, 300)
+        try:
+            recreate_longpoll()
+        except Exception as re_err:
+            print(f'⚠️ Переподключение Long Poll перед перезапуском: {re_err}', flush=True)
+
 
 if __name__ == '__main__':
-    main()
+    run_bot_forever()
