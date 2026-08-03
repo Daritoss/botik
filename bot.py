@@ -159,6 +159,16 @@ PS_BOOKING_DAYS = 7
 
 # Бронь переговорок: максимум на сколько дней вперёд от момента ввода даты пользователем
 BOOKING_ROOM_MAX_AHEAD_DAYS = 30
+# Минимальный срок: не раньше чем через столько календарных дней (1 = только со следующего дня)
+BOOKING_MIN_ADVANCE_DAYS = 1
+BOOKING_ADMIN_CONFIRM_LINE = 'Ждите ответа администратора о подтверждении брони.'
+BOOKING_NAME_PROMPT = (
+    '💬 Вы находитесь в разделе Бронирование переговорных. Прежде чем приступить, ознакомьтесь с правилами. '
+    'Учтите, что бронировать наши помещения могут Институты и подразделения СПбПУ, студенты и студенческие '
+    'объединения, а также партнёры нашего Университета, которые имеют заверенный статус и ответственное лицо '
+    'из числа работников. В других случаях — по согласованию с администрацией.\n\n'
+    '🏢 Введите название мероприятия:'
+)
 
 # Пауза между превью залов (ВК режет частые сообщения одному peer — без паузы long poll «замирает»)
 MEETING_ROOM_PREVIEW_DELAY_SEC = 0.4
@@ -391,6 +401,36 @@ def parse_participants_count(text: str) -> int:
     return int(m.group(0))
 
 
+def is_weekday(date_value) -> bool:
+    """Понедельник–пятница (date или datetime)."""
+    if isinstance(date_value, datetime.datetime):
+        date_value = date_value.date()
+    return date_value.weekday() < 5
+
+
+def earliest_booking_date() -> datetime.date:
+    """Самая ранняя допустимая дата брони (не раньше чем через BOOKING_MIN_ADVANCE_DAYS)."""
+    return datetime.date.today() + datetime.timedelta(days=BOOKING_MIN_ADVANCE_DAYS)
+
+
+def validate_meeting_booking_range(booking_start: datetime.datetime, booking_end: datetime.datetime) -> str | None:
+    """
+    Проверка даты/времени брони переговорки.
+    Возвращает код ошибки или None, если всё в порядке.
+    """
+    now = datetime.datetime.now()
+    if booking_start < now:
+        return 'past'
+    if booking_start.date() < earliest_booking_date():
+        return 'min_advance'
+    if not is_weekday(booking_start):
+        return 'weekday'
+    max_dt = now + datetime.timedelta(days=BOOKING_ROOM_MAX_AHEAD_DAYS)
+    if booking_end > max_dt:
+        return 'max_ahead'
+    return None
+
+
 def parse_booking_datetime_range(text: str) -> tuple:
     """Диапазон брони переговорки: ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ"""
     s = str(text or '').strip().replace('\u00a0', ' ')
@@ -423,6 +463,8 @@ def build_room_booking_summary(booking: dict) -> str:
     time_range = format_booking_time_range(booking['datetime_start'], booking['datetime_end'])
     equipment = format_booking_equipment(booking.get('equipment'))
     return f'''Заявка на бронь переговорки принята!
+
+{BOOKING_ADMIN_CONFIRM_LINE}
 
 Детали брони:
 • Мероприятие: {booking['name']}
@@ -614,6 +656,22 @@ def send_message(user_id, message, keyboard=None, log_response=True):
             pass
     return True
 
+def mark_conversation_for_admin_review(user_id, reason='бронь'):
+    """
+    После автоответа бота помечает диалог для администраторов сообщества:
+    непрочитанным, «без ответа» и важным (как служебные записки).
+    """
+    for method_name, kwargs in (
+        ('markAsUnreadConversation', {'peer_id': user_id}),
+        ('markAsAnsweredConversation', {'peer_id': user_id, 'answered': 0}),
+        ('markAsImportantConversation', {'peer_id': user_id, 'important': 1}),
+    ):
+        try:
+            getattr(vk.messages, method_name)(**kwargs)
+        except Exception as e:
+            print(f'⚠️ {method_name} для {user_id} ({reason}): {e}')
+    print(f'📬 Диалог {user_id} передан администратору на проверку ({reason})')
+
 def _attachment_from_docs_save(saved):
     """Строка attachment для messages.send из ответа docs.save / VkUpload.document."""
     if isinstance(saved, list):
@@ -763,9 +821,11 @@ def build_ps_week_report(start_date):
     for row in rows:
         busy_map.setdefault(row['дата'], set()).add(f"{row['время_начала']}-{row['время_окончания']}")
 
-    lines = ['📅 Занятость PlayStation на неделю:']
+    lines = ['📅 Занятость PlayStation на неделю (только будни):']
     for i in range(PS_BOOKING_DAYS):
         day = start_date + datetime.timedelta(days=i)
+        if not is_weekday(day):
+            continue
         day_iso = day.isoformat()
         day_label = day.strftime('%d.%m.%Y')
         day_busy = sorted(busy_map.get(day_iso, set()))
@@ -1030,7 +1090,7 @@ def handle_incoming_message(message):
                         keyboard=get_booking_menu_keyboard()
                     )
                 elif prev_step == 'booking_name':
-                    send_message(user_id, '🏢 Введите название мероприятия:')
+                    send_message(user_id, BOOKING_NAME_PROMPT)
                 elif prev_step == 'booking_format':
                     send_message(
                         user_id,
@@ -1051,7 +1111,10 @@ def handle_incoming_message(message):
                 elif prev_step == 'ps_menu':
                     send_message(
                         user_id,
-                        '🎮 Бронирование PlayStation\n\nБронь доступна только на неделю вперед и только на 1 час. Продление — на месте у администратора.\n\nВыберите действие:',
+                        f'🎮 Бронирование PlayStation\n\n'
+                        f'Бронь доступна только на неделю вперед, только на 1 час и только по будням (пн–пт). '
+                        f'Забронировать можно не раньше чем за {BOOKING_MIN_ADVANCE_DAYS} календарный день.\n'
+                        f'Продление — на месте у администратора.\n\nВыберите действие:',
                         keyboard=get_ps_menu_keyboard()
                     )
                 elif prev_step == 'ps_cancel_date':
@@ -1116,7 +1179,11 @@ def handle_incoming_message(message):
         elif '🎮' in text or 'playstation' in text_lower or 'плейстейшн' in text_lower or 'плейстейшен' in text_lower or 'ps' == text_lower:
             send_message(
                 user_id,
-                '🎮 Бронирование PlayStation\n\nБронь доступна только на неделю вперед и только на 1 час. Продление — на месте у администратора.\n\n⏰ Время работы: будни с 09:30 до 20:30\n\nВыберите действие:',
+                f'🎮 Бронирование PlayStation\n\n'
+                f'Бронь доступна только на неделю вперед, только на 1 час и только по будням (пн–пт). '
+                f'Забронировать можно не раньше чем за {BOOKING_MIN_ADVANCE_DAYS} календарный день.\n'
+                f'Продление — на месте у администратора.\n\n'
+                f'⏰ Время работы: будни с 09:30 до 20:30\n\nВыберите действие:',
                 keyboard=get_ps_menu_keyboard()
             )
             state['step'] = 'ps_menu'
@@ -1510,6 +1577,7 @@ def handle_incoming_message(message):
                 '📝 Правила регистрации:\n'
                 '• Бронирование — не позднее чем за 30 календарных дней до события\n'
                 f'• Дата и время мероприятия в боте — не позднее чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с момента заявки\n'
+                f'• Бронь возможна только на будни (пн–пт) и не раньше чем за {BOOKING_MIN_ADVANCE_DAYS} календарный день до мероприятия\n'
                 '• Обязательна регистрация в Leader-ID минимум за 24 часа до начала. Без активной страницы события бронь аннулируется\n'
                 '• Каждый участник должен иметь профиль в Leader-ID; у стойки — скан персонального QR-кода\n'
                 '• Мультимедийное оборудование — по запросу через администратора или технического специалиста\n\n'
@@ -1517,7 +1585,7 @@ def handle_incoming_message(message):
                 keyboard=get_booking_menu_keyboard()
             )
         elif 'забронировать' in text_lower or '📅' in text:
-            send_message(user_id, '🏢 Введите название мероприятия:')
+            send_message(user_id, BOOKING_NAME_PROMPT)
             state['step'] = 'booking_name'
             state['booking'] = {}
         else:
@@ -1571,7 +1639,9 @@ def handle_incoming_message(message):
                     user_id,
                     '🕒 Введите дату и время начала и окончания мероприятия в формате '
                     'ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30).\n'
-                    f'Дата не может быть позже чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с текущего момента.'
+                    f'• Только будни (пн–пт)\n'
+                    f'• Не раньше чем через {BOOKING_MIN_ADVANCE_DAYS} календарный день (с {earliest_booking_date().strftime("%d.%m.%Y")})\n'
+                    f'• Не позже чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с текущего момента'
                 )
                 state['step'] = 'booking_datetime'
                 state['suitable_rooms'] = suitable_rooms  # Сохраняем список подходящих переговорок
@@ -1586,15 +1656,27 @@ def handle_incoming_message(message):
     elif state['step'] == 'booking_datetime':
         try:
             booking_start, booking_end = parse_booking_datetime_range(text)
-            today = datetime.datetime.now()
-            max_date = today + datetime.timedelta(days=BOOKING_ROOM_MAX_AHEAD_DAYS)
+            err = validate_meeting_booking_range(booking_start, booking_end)
+            max_date = datetime.datetime.now() + datetime.timedelta(days=BOOKING_ROOM_MAX_AHEAD_DAYS)
 
-            if booking_start < today:
+            if err == 'past':
                 send_message(
                     user_id,
                     '❌ Дата не может быть в прошлом. Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ:'
                 )
-            elif booking_end > max_date:
+            elif err == 'min_advance':
+                send_message(
+                    user_id,
+                    f'❌ Бронь возможна не раньше чем через {BOOKING_MIN_ADVANCE_DAYS} календарный день.\n'
+                    f'Самая ранняя допустимая дата: {earliest_booking_date().strftime("%d.%m.%Y")}.\n\n'
+                    'Введите другой диапазон (ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ):'
+                )
+            elif err == 'weekday':
+                send_message(
+                    user_id,
+                    '❌ Бронь переговорок доступна только по будням (пн–пт). Введите другую дату и время:'
+                )
+            elif err == 'max_ahead':
                 send_message(
                     user_id,
                     f'❌ Бронь переговорки возможна не дальше чем на {BOOKING_ROOM_MAX_AHEAD_DAYS} суток от момента заявки (около 1 месяца).\n'
@@ -1694,6 +1776,7 @@ def handle_incoming_message(message):
                 traceback.print_exc()
 
             send_message(user_id, build_room_booking_summary(booking), keyboard=get_main_keyboard())
+            mark_conversation_for_admin_review(user_id, reason='бронь переговорки')
             reset_state(user_id)
         else:
             booking = state.get('booking', {})
@@ -1727,12 +1810,15 @@ def handle_incoming_message(message):
         try:
             date_obj = datetime.datetime.strptime(text, '%d.%m.%Y').date()
             today = datetime.date.today()
-            days_diff = (date_obj - today).days
-            if days_diff < 0:
-                send_message(user_id, '❌ Дата не может быть в прошлом. Введите дату в формате ДД.ММ.ГГГГ:')
-            elif days_diff >= PS_BOOKING_DAYS:
+            if date_obj < earliest_booking_date():
+                send_message(
+                    user_id,
+                    f'❌ Бронь возможна не раньше чем через {BOOKING_MIN_ADVANCE_DAYS} календарный день '
+                    f'(с {earliest_booking_date().strftime("%d.%m.%Y")}). Введите другую дату:'
+                )
+            elif (date_obj - today).days >= PS_BOOKING_DAYS:
                 send_message(user_id, '❌ Бронь доступна только на неделю вперед. Введите другую дату:')
-            elif date_obj.weekday() >= 5:
+            elif not is_weekday(date_obj):
                 send_message(user_id, '❌ PlayStation доступен только по будням (пн–пт). Введите другую дату:')
             else:
                 state['ps']['date'] = text
@@ -1825,9 +1911,10 @@ def handle_incoming_message(message):
                 f'📅 Дата: {ps["date"]}\n'
                 f'🕐 Время: {ps["time"]} – {ps["end_time"]}\n'
                 f'⏱ Продолжительность: {ps["hours"]} ч.\n\n'
-                f'Мы свяжемся с вами для подтверждения.',
+                f'{BOOKING_ADMIN_CONFIRM_LINE}',
                 keyboard=get_main_keyboard()
             )
+            mark_conversation_for_admin_review(user_id, reason='PlayStation')
             reset_state(user_id)
         elif text_lower == 'нет':
             send_message(
