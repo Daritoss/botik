@@ -169,6 +169,10 @@ BOOKING_NAME_PROMPT = (
     'из числа работников. В других случаях — по согласованию с администрацией.\n\n'
     '🏢 Введите название мероприятия:'
 )
+BOOKING_WEEKEND_MESSAGE = (
+    '❌ Приём заявок на бронь переговорок доступен только по будням (пн–пт).\n'
+    'Пожалуйста, напишите нам в рабочий день.'
+)
 
 # Пауза между превью залов (ВК режет частые сообщения одному peer — без паузы long poll «замирает»)
 MEETING_ROOM_PREVIEW_DELAY_SEC = 0.4
@@ -413,6 +417,11 @@ def earliest_booking_date() -> datetime.date:
     return datetime.date.today() + datetime.timedelta(days=BOOKING_MIN_ADVANCE_DAYS)
 
 
+def is_booking_acceptance_day() -> bool:
+    """Сегодня будний день — бот принимает заявки на бронь переговорок."""
+    return is_weekday(datetime.date.today())
+
+
 def validate_meeting_booking_range(booking_start: datetime.datetime, booking_end: datetime.datetime) -> str | None:
     """
     Проверка даты/времени брони переговорки.
@@ -423,8 +432,6 @@ def validate_meeting_booking_range(booking_start: datetime.datetime, booking_end
         return 'past'
     if booking_start.date() < earliest_booking_date():
         return 'min_advance'
-    if not is_weekday(booking_start):
-        return 'weekday'
     max_dt = now + datetime.timedelta(days=BOOKING_ROOM_MAX_AHEAD_DAYS)
     if booking_end > max_dt:
         return 'max_ahead'
@@ -1577,7 +1584,7 @@ def handle_incoming_message(message):
                 '📝 Правила регистрации:\n'
                 '• Бронирование — не позднее чем за 30 календарных дней до события\n'
                 f'• Дата и время мероприятия в боте — не позднее чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с момента заявки\n'
-                f'• Бронь возможна только на будни (пн–пт) и не раньше чем за {BOOKING_MIN_ADVANCE_DAYS} календарный день до мероприятия\n'
+                f'• Бронь не раньше чем за {BOOKING_MIN_ADVANCE_DAYS} календарный день до мероприятия\n'
                 '• Обязательна регистрация в Leader-ID минимум за 24 часа до начала. Без активной страницы события бронь аннулируется\n'
                 '• Каждый участник должен иметь профиль в Leader-ID; у стойки — скан персонального QR-кода\n'
                 '• Мультимедийное оборудование — по запросу через администратора или технического специалиста\n\n'
@@ -1585,6 +1592,9 @@ def handle_incoming_message(message):
                 keyboard=get_booking_menu_keyboard()
             )
         elif 'забронировать' in text_lower or '📅' in text:
+            if not is_booking_acceptance_day():
+                send_message(user_id, BOOKING_WEEKEND_MESSAGE, keyboard=get_booking_menu_keyboard())
+                return
             send_message(user_id, BOOKING_NAME_PROMPT)
             state['step'] = 'booking_name'
             state['booking'] = {}
@@ -1639,9 +1649,8 @@ def handle_incoming_message(message):
                     user_id,
                     '🕒 Введите дату и время начала и окончания мероприятия в формате '
                     'ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ (например, 27.05.2026 16:30-17:30).\n'
-                    f'• Только будни (пн–пт)\n'
-                    f'• Не раньше чем через {BOOKING_MIN_ADVANCE_DAYS} календарный день (с {earliest_booking_date().strftime("%d.%m.%Y")})\n'
-                    f'• Не позже чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с текущего момента'
+                    f'Не раньше чем через {BOOKING_MIN_ADVANCE_DAYS} календарный день (с {earliest_booking_date().strftime("%d.%m.%Y")}). '
+                    f'Не позже чем через {BOOKING_ROOM_MAX_AHEAD_DAYS} суток с текущего момента.'
                 )
                 state['step'] = 'booking_datetime'
                 state['suitable_rooms'] = suitable_rooms  # Сохраняем список подходящих переговорок
@@ -1670,11 +1679,6 @@ def handle_incoming_message(message):
                     f'❌ Бронь возможна не раньше чем через {BOOKING_MIN_ADVANCE_DAYS} календарный день.\n'
                     f'Самая ранняя допустимая дата: {earliest_booking_date().strftime("%d.%m.%Y")}.\n\n'
                     'Введите другой диапазон (ДД.ММ.ГГГГ ЧЧ:ММ-ЧЧ:ММ):'
-                )
-            elif err == 'weekday':
-                send_message(
-                    user_id,
-                    '❌ Бронь переговорок доступна только по будням (пн–пт). Введите другую дату и время:'
                 )
             elif err == 'max_ahead':
                 send_message(
