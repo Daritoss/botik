@@ -5,6 +5,8 @@ import datetime
 import os
 import random
 import re
+import shutil
+import tempfile
 import threading
 import time
 import json
@@ -175,7 +177,8 @@ BOOKING_WEEKEND_MESSAGE = (
 )
 
 # Пауза между превью залов (ВК режет частые сообщения одному peer — без паузы long poll «замирает»)
-MEETING_ROOM_PREVIEW_DELAY_SEC = 0.4
+MEETING_ROOM_PREVIEW_DELAY_SEC = 0.8
+NEGOTIATIAS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'negotiatias')
 
 # Long Poll: пауза при сбоях (экспоненциальный рост до максимума)
 LONGPOLL_RETRY_INITIAL_SEC = 5
@@ -506,7 +509,7 @@ ROOM_DESCRIPTIONS = {
     '«Лекторий» – 50–100 чел.': '9️⃣ «Лекторий» — от 50 до 100 человек включительно\nАудитория для массовых мероприятий',
 }
 
-# Имя файла в negotiatias/ или None — только текст (без вложения)
+# Имя файла в negotiatias/ — resolve_room_photo_path ищет также по ключевым словам
 ROOM_PHOTO_FILES = {
     '«Код» – до 7 чел.': 'Код.jpg',
     '«Экология» – до 7 чел.': 'Экология.jpg',
@@ -516,25 +519,85 @@ ROOM_PHOTO_FILES = {
     '«Инноватика» – до 20 чел.': 'Инноватика.jpg',
     '«Эврика» – до 20 чел.': 'Эврика.jpg',
     '«Открытие» – 20–60 чел.': 'Открытие.jpg',
-    '«Лекторий» – 50–100 чел.': 'Лекторий (1 этаж).jpg',
+    '«Лекторий» – 50–100 чел.': 'Лекторий.jpg',
 }
+
+ROOM_PHOTO_KEYWORDS = {
+    '«Код» – до 7 чел.': ('код',),
+    '«Экология» – до 7 чел.': ('эколог',),
+    '«Сети» – до 7 чел.': ('сети',),
+    '«Индустрия» – до 20 чел.': ('индустр',),
+    '«Энергия» – до 20 чел.': ('энерг',),
+    '«Инноватика» – до 20 чел.': ('инноват',),
+    '«Эврика» – до 20 чел.': ('эврик',),
+    '«Открытие» – 20–60 чел.': ('открыт',),
+    '«Лекторий» – 50–100 чел.': ('лектор',),
+}
+
+
+def _negotiatias_image_files() -> dict:
+    """{имя_файла_lower: полный_путь} для всех изображений в negotiatias/."""
+    files = {}
+    try:
+        for fname in os.listdir(NEGOTIATIAS_DIR):
+            if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                files[fname.lower()] = os.path.join(NEGOTIATIAS_DIR, fname)
+    except OSError as e:
+        print(f'⚠️ Не удалось прочитать {NEGOTIATIAS_DIR}: {e}')
+    return files
+
+
+def resolve_room_photo_path(room: str) -> str | None:
+    """Найти файл фото зала: точное имя, затем по ключевым словам в negotiatias/."""
+    preferred = ROOM_PHOTO_FILES.get(room)
+    if preferred:
+        exact = os.path.join(NEGOTIATIAS_DIR, preferred)
+        if os.path.isfile(exact):
+            return exact
+
+    catalog = _negotiatias_image_files()
+    if preferred:
+        hit = catalog.get(preferred.lower())
+        if hit:
+            return hit
+
+    keywords = ROOM_PHOTO_KEYWORDS.get(room, ())
+    for fname_lower, path in catalog.items():
+        if any(kw in fname_lower for kw in keywords):
+            return path
+    return None
+
+
+def validate_room_photos_on_startup() -> None:
+    """Проверка наличия фото для всех залов при запуске."""
+    missing = [room for room in rooms if not resolve_room_photo_path(room)]
+    if missing:
+        print(f'⚠️ Нет фото для залов: {missing}')
+    else:
+        print('✅ Фото переговорок: все файлы на месте')
 
 
 def send_meeting_room_previews(user_id: int, offered_rooms: list) -> None:
     """Отправить описание и фото только для залов из `offered_rooms` (тот же порядок и состав, что у клавиатуры)."""
+    prev_path = None
     for i, room in enumerate(offered_rooms):
         if i > 0:
-            time.sleep(MEETING_ROOM_PREVIEW_DELAY_SEC)
+            delay = MEETING_ROOM_PREVIEW_DELAY_SEC
+            if prev_path and os.path.getsize(prev_path) > 500_000:
+                delay = max(delay, 1.2)
+            time.sleep(delay)
         desc = ROOM_DESCRIPTIONS.get(room)
         if desc is None:
             print(f'⚠️ Нет описания для зала в превью: {room!r}')
             continue
-        fname = ROOM_PHOTO_FILES.get(room)
-        if fname:
-            photo_path = os.path.join(SCRIPT_DIR, 'negotiatias', fname)
-            if not send_photo(user_id, photo_path, desc):
+        photo_path = resolve_room_photo_path(room)
+        prev_path = photo_path
+        if photo_path:
+            if not send_photo(user_id, photo_path, desc, room_label=room):
+                print(f'⚠️ Фото не отправлено для {room!r}, путь: {photo_path}')
                 send_message(user_id, desc, log_response=False)
         else:
+            print(f'⚠️ Файл фото не найден для {room!r}')
             send_message(user_id, desc, log_response=False)
 
 
@@ -747,61 +810,116 @@ def send_document(user_id, file_path, message='', keyboard=None):
         traceback.print_exc()
         return False
 
-def send_photo(user_id, photo_path, message=""):
-    """Отправка изображения в диалог: загрузка как документ (jpg), без scope photos для photo_messages."""
+def _attachment_from_photos_upload(photos) -> str:
+    """Строка attachment для messages.send из ответа photo_messages."""
+    if isinstance(photos, list):
+        if not photos:
+            raise ValueError('Пустой ответ photo upload')
+        photo = photos[0]
+    else:
+        photo = photos
+    if not isinstance(photo, dict):
+        raise ValueError(f'Неожиданный ответ загрузки фото: {type(photo).__name__}')
+    owner_id = photo.get('owner_id')
+    photo_id = photo.get('id')
+    if owner_id is None or photo_id is None:
+        raise ValueError(f'Нет owner_id/id в ответе фото: {photo!r}')
+    attachment = f'photo{owner_id}_{photo_id}'
+    access_key = photo.get('access_key')
+    if access_key:
+        attachment += f'_{access_key}'
+    return attachment
+
+
+def _safe_upload_copy(photo_path: str) -> tuple[str, bool]:
+    """Копия файла с простым именем для загрузки во VK."""
+    base = os.path.basename(photo_path)
+    if re.fullmatch(r'[\w\-]+\.(jpg|jpeg|png|webp)', base, re.IGNORECASE):
+        return photo_path, False
+    ext = os.path.splitext(base)[1] or '.jpg'
+    fd, tmp_path = tempfile.mkstemp(suffix=ext.lower(), prefix='room_')
+    os.close(fd)
+    shutil.copy2(photo_path, tmp_path)
+    return tmp_path, True
+
+
+def _vk_send_with_attachment(user_id, text, attachment) -> bool:
+    for attempt in range(4):
+        try:
+            vk.messages.send(
+                user_id=user_id,
+                message=text,
+                attachment=attachment,
+                random_id=random.randint(0, 2**31),
+            )
+            return True
+        except vk_api.exceptions.ApiError as e:
+            if e.code == 6 and attempt < 3:
+                time.sleep(0.8 + attempt * 0.5)
+                continue
+            print(f'⚠️ VK API при отправке вложения ({e.code}): {e}')
+            return False
+    return False
+
+
+def send_photo(user_id, photo_path, message='', room_label=''):
+    """Отправка изображения: photo_messages (превью), затем document (запасной вариант)."""
+    temp_path = None
+    label = room_label or os.path.basename(photo_path or '')
     try:
-        if not os.path.exists(photo_path):
-            print(f"Фото не найдено по пути: {photo_path}")
+        if not photo_path or not os.path.isfile(photo_path):
+            print(f'Фото не найдено: {photo_path!r} ({label})')
             return False
 
-        file_name = os.path.basename(photo_path)
+        upload_path, temp_path = _safe_upload_copy(photo_path)
         upload = vk_api.VkUpload(vk_session)
+        text = message.strip() if message else 'Фото переговорки'
+        safe_title = re.sub(r'[^\w\s\-]', '', os.path.basename(photo_path), flags=re.UNICODE).strip() or 'room'
+
+        try:
+            photos = upload.photo_messages([upload_path], peer_id=user_id)
+            attachment = _attachment_from_photos_upload(photos)
+            if _vk_send_with_attachment(user_id, text, attachment):
+                return True
+        except Exception as e:
+            print(f'⚠️ photo_messages для {label}: {e}')
+
         saved = None
         last_err = None
         for group_id in (GROUP_ID, None):
             try:
                 if group_id is not None:
                     saved = upload.document(
-                        photo_path,
-                        title=file_name,
+                        upload_path,
+                        title=f'{safe_title}.jpg',
                         message_peer_id=user_id,
                         group_id=group_id,
                     )
                 else:
                     saved = upload.document_message(
-                        doc=photo_path,
+                        doc=upload_path,
                         peer_id=user_id,
-                        title=file_name,
+                        title=f'{safe_title}.jpg',
                     )
                 break
             except Exception as e:
                 last_err = e
                 saved = None
         if saved is None:
-            raise last_err
+            raise last_err or RuntimeError('document upload failed')
 
         attachment = _attachment_from_docs_save(saved)
-        text = message.strip() if message else 'Фото переговорки'
-        for attempt in range(4):
-            try:
-                vk.messages.send(
-                    user_id=user_id,
-                    message=text,
-                    attachment=attachment,
-                    random_id=random.randint(0, 2**31),
-                )
-                return True
-            except vk_api.exceptions.ApiError as e:
-                if e.code == 6 and attempt < 3:
-                    time.sleep(0.6 + attempt * 0.4)
-                    continue
-                print(f'⚠️ Ошибка VK API при отправке фото ({e.code}): {e}')
-                return False
+        return _vk_send_with_attachment(user_id, text, attachment)
     except Exception as e:
-        print(f"❌ Ошибка отправки фото (документом): {e}")
-        import traceback
+        print(f'❌ Ошибка отправки фото ({label}): {e}')
         traceback.print_exc()
         return False
+    finally:
+        if temp_path and os.path.isfile(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 def get_ps_available_times(date_obj):
     """Получить свободные слоты PlayStation на дату"""
@@ -2137,6 +2255,7 @@ def handle_incoming_message(message):
 
 def main():
     global _stats_thread_started
+    validate_room_photos_on_startup()
     print("🤖 Бот запущен и слушает события...", flush=True)
 
     # Один поток статистики на весь процесс (при перезапуске main не плодим новые)
