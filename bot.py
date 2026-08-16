@@ -163,6 +163,8 @@ PS_BOOKING_DAYS = 7
 BOOKING_ROOM_MAX_AHEAD_DAYS = 30
 # Минимальный срок: не раньше чем через столько календарных дней (1 = только со следующего дня)
 BOOKING_MIN_ADVANCE_DAYS = 1
+# PlayStation: 0 — можно бронировать в тот же день
+PS_BOOKING_MIN_ADVANCE_DAYS = 0
 BOOKING_ADMIN_CONFIRM_LINE = 'Ждите ответа администратора о подтверждении брони.'
 BOOKING_NAME_PROMPT = (
     '💬 Вы находитесь в разделе Бронирование переговорных. Прежде чем приступить, ознакомьтесь с правилами. '
@@ -416,8 +418,13 @@ def is_weekday(date_value) -> bool:
 
 
 def earliest_booking_date() -> datetime.date:
-    """Самая ранняя допустимая дата брони (не раньше чем через BOOKING_MIN_ADVANCE_DAYS)."""
+    """Самая ранняя допустимая дата брони переговорки."""
     return datetime.date.today() + datetime.timedelta(days=BOOKING_MIN_ADVANCE_DAYS)
+
+
+def earliest_ps_booking_date() -> datetime.date:
+    """Самая ранняя допустимая дата брони PlayStation."""
+    return datetime.date.today() + datetime.timedelta(days=PS_BOOKING_MIN_ADVANCE_DAYS)
 
 
 def is_booking_acceptance_day() -> bool:
@@ -922,15 +929,20 @@ def send_photo(user_id, photo_path, message='', room_label=''):
                 pass
 
 def get_ps_available_times(date_obj):
-    """Получить свободные слоты PlayStation на дату"""
+    """Получить свободные слоты PlayStation на дату (на сегодня — только будущие)."""
     date_iso = date_obj.isoformat()
     busy_slots = db.get_ps_busy_slots(date_iso)
     busy_start_times = {slot['время_начала'] for slot in busy_slots}
 
+    now = datetime.datetime.now()
+    today = now.date()
     available_times = []
     start_dt = datetime.datetime.combine(date_obj, PS_OPEN_TIME)
     end_dt = datetime.datetime.combine(date_obj, PS_CLOSE_TIME)
     while start_dt + datetime.timedelta(hours=PS_SLOT_HOURS) <= end_dt:
+        if date_obj == today and start_dt <= now:
+            start_dt += datetime.timedelta(hours=PS_SLOT_HOURS)
+            continue
         time_str = start_dt.strftime('%H:%M')
         if time_str not in busy_start_times:
             available_times.append(time_str)
@@ -1237,8 +1249,8 @@ def handle_incoming_message(message):
                     send_message(
                         user_id,
                         f'🎮 Бронирование PlayStation\n\n'
-                        f'Бронь доступна только на неделю вперед, только на 1 час и только по будням (пн–пт). '
-                        f'Забронировать можно не раньше чем за {BOOKING_MIN_ADVANCE_DAYS} календарный день.\n'
+                        f'Бронь доступна на неделю вперёд, на 1 час и по будням (пн–пт). '
+                        f'Можно забронировать в тот же день, если есть свободные слоты.\n'
                         f'Продление — на месте у администратора.\n\nВыберите действие:',
                         keyboard=get_ps_menu_keyboard()
                     )
@@ -1305,8 +1317,8 @@ def handle_incoming_message(message):
             send_message(
                 user_id,
                 f'🎮 Бронирование PlayStation\n\n'
-                f'Бронь доступна только на неделю вперед, только на 1 час и только по будням (пн–пт). '
-                f'Забронировать можно не раньше чем за {BOOKING_MIN_ADVANCE_DAYS} календарный день.\n'
+                f'Бронь доступна на неделю вперёд, на 1 час и по будням (пн–пт). '
+                f'Можно забронировать в тот же день, если есть свободные слоты.\n'
                 f'Продление — на месте у администратора.\n\n'
                 f'⏰ Время работы: будни с 09:30 до 20:30\n\nВыберите действие:',
                 keyboard=get_ps_menu_keyboard()
@@ -1932,11 +1944,10 @@ def handle_incoming_message(message):
         try:
             date_obj = datetime.datetime.strptime(text, '%d.%m.%Y').date()
             today = datetime.date.today()
-            if date_obj < earliest_booking_date():
+            if date_obj < earliest_ps_booking_date():
                 send_message(
                     user_id,
-                    f'❌ Бронь возможна не раньше чем через {BOOKING_MIN_ADVANCE_DAYS} календарный день '
-                    f'(с {earliest_booking_date().strftime("%d.%m.%Y")}). Введите другую дату:'
+                    f'❌ Дата не может быть в прошлом. Введите дату в формате ДД.ММ.ГГГГ:'
                 )
             elif (date_obj - today).days >= PS_BOOKING_DAYS:
                 send_message(user_id, '❌ Бронь доступна только на неделю вперед. Введите другую дату:')
